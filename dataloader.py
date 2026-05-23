@@ -8,15 +8,18 @@ from torch.utils.data import Dataset, DataLoader
 from typing import Optional, Callable, List, Tuple, Dict
 import torchvision.transforms.functional as trans_func
 import torchvision.transforms as trans
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+try:
+    import albumentations as A
+except ImportError:
+    A = None
 
 
 def letterbox_resize(image: Image.Image, target_size: int, target: dict) -> Tuple[Image.Image, dict]:
     """
     Resize ảnh về target_size x target_size bằng cách:
-      1. Scale giữ nguyên aspect ratio (fit trong target_size)
-      2. Pad hai phía (top/bottom hoặc left/right) cho đủ vuông
+    1. Scale giữ nguyên aspect ratio (fit trong target_size)
+    2. Pad hai phía (top/bottom hoặc left/right) cho đủ vuông
 
     Cập nhật bbox trong target theo đúng tọa độ mới.
     """
@@ -58,9 +61,9 @@ def letterbox_resize(image: Image.Image, target_size: int, target: dict) -> Tupl
     return canvas, target
 
 
-# ---------------------------------------------------------------------------
+
 # Dataset
-# ---------------------------------------------------------------------------
+
 
 class CustomDataset(Dataset):
     def __init__(
@@ -69,7 +72,7 @@ class CustomDataset(Dataset):
         split: str = "train",
         transforms: Optional[Callable] = None,
         normalize: bool = True,
-        img_size: int = 320,         # target size cho letterbox
+        img_size: int = 512,         # target size cho letterbox
     ):
         self.data_root = Path(data_root)
         self.split = split
@@ -124,7 +127,7 @@ class CustomDataset(Dataset):
 
         target = {"boxes": boxes, "labels": labels, "image_id": img_id}
 
-        # ✅ Letterbox resize (scale + pad) — trước augmentation
+        # Letterbox resize (scale + pad) — trước augmentation
         img, target = letterbox_resize(img, self.img_size, target)
 
         # Augmentation (albumentations hoặc custom)
@@ -139,19 +142,20 @@ class CustomDataset(Dataset):
         return img, target
 
 
-# ---------------------------------------------------------------------------
+
 # collate_fn — đơn giản vì tất cả ảnh đã cùng size sau letterbox
-# ---------------------------------------------------------------------------
 
-def collate_fn(batch: List[Tuple[torch.Tensor, Dict]]) -> Tuple[List[torch.Tensor], List[Dict]]:
-    imgs    = [item[0] for item in batch]
+
+def collate_fn(batch):
+    imgs = [item[0] for item in batch]
     targets = [item[1] for item in batch]
-    return list(imgs), list(targets)
+    imgs = torch.stack(imgs, dim=0)
+    return imgs, targets
 
 
-# ---------------------------------------------------------------------------
+
 # Build dataloader
-# ---------------------------------------------------------------------------
+
 
 def build_dataloader(
     data_root: str,
@@ -162,7 +166,7 @@ def build_dataloader(
     normalize: bool = True,
     pin_memory: bool = True,
     drop_last: bool = False,
-    img_size: int = 320,
+    img_size: int = 512,
 ) -> DataLoader:
 
     dataset = CustomDataset(
@@ -188,16 +192,21 @@ def build_dataloader(
     return loader
 
 
-# ---------------------------------------------------------------------------
+
 # Albumentations augmentation (sau letterbox, bbox đã ở tọa độ mới)
-# ---------------------------------------------------------------------------
+
 
 def albumentations_transform():
+    if A is None:
+        raise ImportError(
+            "albumentations is not installed. Install it or run training with --no_aug."
+        )
+
     albu = A.Compose([
         A.HorizontalFlip(p=0.5),
         A.RandomBrightnessContrast(p=0.3),
-        A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1,
-                           rotate_limit=10, p=0.3),
+        A.Affine(translate_percent=(-0.05, 0.05), scale=(0.9, 1.1),
+                 rotate=(-10, 10), p=0.3),
         A.OneOf([
             A.MotionBlur(p=1),
             A.GaussNoise(p=1),
@@ -231,9 +240,9 @@ def albumentations_transform():
     return transform
 
 
-# ---------------------------------------------------------------------------
+
 # Visualize loader (không normalize để dễ hiển thị)
-# ---------------------------------------------------------------------------
+
 
 def build_visualized_loader(
     data_root: str,
@@ -241,7 +250,7 @@ def build_visualized_loader(
     batch_size: int = 8,
     num_workers: int = 4,
     transforms=None,
-    img_size: int = 320,
+    img_size: int = 512,
 ) -> DataLoader:
     return build_dataloader(
         data_root=data_root,

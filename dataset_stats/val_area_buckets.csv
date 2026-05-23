@@ -1,0 +1,6 @@
+split,class,medium_5-20%,large_>=20%,small_1-5%,tiny_<1%
+val,person,342,368,212,152
+val,car,57,70,79,77
+val,dog,47,134,20,5
+val,cat,23,141,10,2
+val,chair,143,54,72,13

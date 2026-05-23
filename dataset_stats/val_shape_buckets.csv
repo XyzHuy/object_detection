@@ -1,0 +1,6 @@
+split,class,portrait_0.5-0.8,landscape_1.25-2,square_0.8-1.25,tall_<0.5,wide_>2
+val,person,410,39,221,397,7
+val,car,17,109,61,5,91
+val,dog,59,57,72,5,13
+val,cat,46,53,65,3,9
+val,chair,124,30,79,40,9

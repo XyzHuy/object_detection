@@ -1,0 +1,5 @@
+torch
+torchvision
+timm>=1.0.27
+albumentations>=2.0.8
+tqdm

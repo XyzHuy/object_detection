@@ -1,0 +1,6 @@
+split,class,large_>=20%,medium_5-20%,small_1-5%,tiny_<1%
+train,person,1981,1844,1331,673
+train,car,361,245,389,344
+train,dog,645,279,90,14
+train,cat,645,150,34,4
+train,chair,272,650,573,118
