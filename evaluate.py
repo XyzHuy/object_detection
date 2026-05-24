@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import logging
 import sys
@@ -53,9 +54,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nms_iou", type=float, default=0.65)
     parser.add_argument("--max_det", type=int, default=100)
     parser.add_argument("--log_dir", default="logs")
-    parser.add_argument("--predictions_output")
-    parser.add_argument("--metrics_output")
+    parser.add_argument("--predictions_output", default = "predictions.json")
+    parser.add_argument("--metrics_output", default = "metrics.json")
+    parser.add_argument("--official_score_output", default ="val_score.json")
+    parser.add_argument("--official_evaluator", default="final_public/public/tools/evaluate_predictions.py")
+    parser.add_argument("--official_ground_truth")
     return parser.parse_args()
+
+
+def run_official_evaluator(
+    evaluator_path: str | Path,
+    ground_truth_path: str | Path,
+    predictions: list[dict],
+    output_path: str | Path | None,
+    max_detections_per_image: int,
+) -> dict:
+    evaluator_path = Path(evaluator_path)
+    spec = importlib.util.spec_from_file_location("public_evaluate_predictions", evaluator_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load official evaluator from {evaluator_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    ground_truth = module.load_json(Path(ground_truth_path))
+    classes, image_info = module.validate_ground_truth(ground_truth)
+    normalized = module.normalize_predictions(
+        predictions,
+        classes=classes,
+        image_info=image_info,
+        max_detections_per_image=max_detections_per_image,
+        require_complete=True,
+    )
+    result = module.evaluate(
+        ground_truth=ground_truth,
+        predictions=normalized,
+        classes=classes,
+        iou_threshold=0.5,
+    )
+
+    if output_path:
+        Path(output_path).write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return result
+
 
 
 def main() -> None:
@@ -115,7 +156,8 @@ def main() -> None:
         Path(args.metrics_output).write_text(metrics_text + "\n", encoding="utf-8")
         logger.info("Wrote metrics JSON to %s", args.metrics_output)
 
-    if args.predictions_output:
+    predictions = None
+    if args.predictions_output or args.official_score_output:
         source = Path(args.data_root) / args.split / "images"
         annotation_index = load_annotation_index(args.data_root, args.split)
         predictions = []
@@ -132,12 +174,32 @@ def main() -> None:
             )
             result["image_id"] = annotation_index.get(image_path.name, {}).get("id", image_path.name)
             predictions.append(result)
-        Path(args.predictions_output).write_text(
-            json.dumps(predictions, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+        if args.predictions_output:
+            Path(args.predictions_output).write_text(
+                json.dumps(predictions, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            logger.info("Wrote predictions JSON to %s", args.predictions_output)
+        if args.official_score_output:
+            official_ground_truth = args.official_ground_truth or str(Path(args.data_root) / "annotations" / f"{args.split}.json")
+            official_metrics = run_official_evaluator(
+                evaluator_path=args.official_evaluator,
+                ground_truth_path=official_ground_truth,
+                predictions=predictions or [],
+                output_path=args.official_score_output,
+                max_detections_per_image=args.max_det,
+            )
+            logger.info(
+            "Official evaluator: mAP@0.5=%.6f micro_P=%.6f micro_R=%.6f predictions=%d",
+            official_metrics["mAP@0.5"],
+            official_metrics["micro_precision"],
+            official_metrics["micro_recall"],
+            official_metrics["num_predictions"],
         )
-        logger.info("Wrote predictions JSON to %s", args.predictions_output)
-
+        logger.info("Wrote official score JSON to %s", args.official_score_output)
 
 if __name__ == "__main__":
     main()
+
+# python3 evaluate.py --checkpoint checkpoints/base/best.pth --log_dir logs/eval_base --predictions_output predictions_base.json --metrics_output metrics_base.json --official_score_output score_base.json
+# python3 evaluate.py --checkpoint checkpoints/local_JEPA/best.pth --log_dir logs/eval_local_JEPA --predictions_output predictions_local_JEPA.json --metrics_output metrics_local_JEPA.json --official_score_output score_local_JEPA.json

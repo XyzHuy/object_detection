@@ -50,7 +50,6 @@ def load_model(checkpoint_path: str | Path, num_classes: int, device: torch.devi
     model = YOLOv8Scratch(num_classes=num_classes, pretrained_backbone=False, use_cspdarknet=True)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
-    state = {key: value for key, value in state.items() if not key.startswith("local_jepa.")}
     model.load_state_dict(state)
     model.to(device).eval()
     return model, checkpoint if isinstance(checkpoint, dict) else {}
@@ -112,7 +111,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_root", default="final_public/public")
     parser.add_argument("--split", default="val")
     parser.add_argument("--img_size", type=int, default=512)
-    parser.add_argument("--conf_threshold", type=float, default=0.25)
+    parser.add_argument("--conf_threshold", type=float, default=0.001)
     parser.add_argument("--nms_iou", type=float, default=0.65)
     parser.add_argument("--max_det", type=int, default=100)
     return parser.parse_args()

@@ -4,10 +4,12 @@ import argparse
 import json
 import logging
 import math
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -35,7 +37,7 @@ DEFAULT_LOCAL_JEPA_ALPHA = 0.2
 DEFAULT_LOCAL_JEPA_FINAL_ALPHA = 0.05
 DEFAULT_LOCAL_JEPA_WARMUP_EPOCHS = 5
 DEFAULT_LOCAL_JEPA_DECAY_START_EPOCH = 50
-
+DEFAULT_SEED = 42
 
 def setup_logger(log_dir: str | Path) -> tuple[logging.Logger, Path]:
     log_dir = Path(log_dir)
@@ -108,6 +110,17 @@ def local_jepa_alpha_for_epoch(
     progress = min(max(progress, 0.0), 1.0)
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return final_alpha + (peak_alpha - final_alpha) * cosine
+
+def set_seed(seed: int, deterministic: bool = False) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    if deterministic:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
+
 
 
 def train_one_epoch(
@@ -275,6 +288,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--no_aug", action="store_true")
     parser.add_argument("--scratch_backbone", action="store_true")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Set to -1 to disable fixed seeding.")
+    parser.add_argument("--deterministic", action="store_true", help="Use deterministic PyTorch kernels when available.")
     return parser.parse_args()
 
 
@@ -290,6 +305,12 @@ def main() -> None:
     logger.info("Device: %s", device)
     logger.info("Classes (%d): %s", len(classes), ", ".join(classes))
 
+    run_seed = args.seed if args.seed >= 0 else None
+    if run_seed is not None:
+        set_seed(run_seed, deterministic=args.deterministic)
+        logger.info("Seed: %d deterministic=%s", run_seed, args.deterministic)
+    else:
+        logger.info("Seed: disabled")
     transforms = None if args.no_aug else albumentations_transform()
     train_loader = build_dataloader(
         args.data_root,
@@ -298,6 +319,7 @@ def main() -> None:
         num_workers=args.num_workers,
         transforms=transforms,
         img_size=args.img_size,
+        seed=run_seed,
     )
     val_loader = build_dataloader(
         args.data_root,
@@ -306,6 +328,7 @@ def main() -> None:
         num_workers=args.num_workers,
         transforms=None,
         img_size=args.img_size,
+        seed=run_seed + 1 if run_seed is not None else None,
     )
 
     model = YOLOv8Scratch(
@@ -458,3 +481,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# python3 train.py --use_local_jepa --output_dir checkpoints/local_JEPA --log_dir logs/local_JEPA
+# python3 train.py --output_dir checkpoints/base --log_dir logs/base

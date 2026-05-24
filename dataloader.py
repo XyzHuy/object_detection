@@ -1,5 +1,6 @@
 import os
 import json
+import random
 import torch
 import numpy as np
 from pathlib import Path
@@ -152,6 +153,10 @@ def collate_fn(batch):
     imgs = torch.stack(imgs, dim=0)
     return imgs, targets
 
+def seed_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 # Build dataloader
@@ -167,6 +172,7 @@ def build_dataloader(
     pin_memory: bool = True,
     drop_last: bool = False,
     img_size: int = 512,
+    seed: Optional[int] = None,
 ) -> DataLoader:
 
     dataset = CustomDataset(
@@ -178,6 +184,10 @@ def build_dataloader(
     )
 
     shuffle = (split == "train")
+    generator = None
+    if seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
 
     loader = DataLoader(
         dataset=dataset,
@@ -187,6 +197,8 @@ def build_dataloader(
         collate_fn=collate_fn,
         pin_memory=pin_memory and torch.cuda.is_available(),
         drop_last=drop_last,
+        worker_init_fn=seed_worker if seed is not None else None,
+        generator=generator,
     )
 
     return loader
