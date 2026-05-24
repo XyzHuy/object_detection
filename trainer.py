@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import sys
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -11,18 +14,48 @@ from tqdm import tqdm
 
 from dataloader import albumentations_transform, build_dataloader
 from loss import YOLOv8Loss
-from metrics import detection_metrics, non_max_suppression
+from metrics import detection_metrics, filter_predictions_by_score, non_max_suppression
 from model import YOLOv8Scratch
 
 
 DEFAULT_IMG_SIZE = 512
 DEFAULT_EPOCHS = 80
-DEFAULT_BATCH_SIZE = 4
-DEFAULT_LR = 2e-4
+DEFAULT_BATCH_SIZE = 64
+DEFAULT_LR = 5e-4
+DEFAULT_BACKBONE_LR = 7.5e-5
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_FREEZE_BACKBONE_EPOCHS = 5
+DEFAULT_EARLY_STOP_PATIENCE = 20
+DEFAULT_MIN_DELTA = 1e-4
 DEFAULT_CONF_THRESHOLD = 0.001
 DEFAULT_NMS_IOU = 0.65
+DEFAULT_MAX_DET = 100
+
+
+def setup_logger(log_dir: str | Path) -> tuple[logging.Logger, Path]:
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    logger = logging.getLogger("trainer")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    return logger, log_path
 
 
 def load_classes(data_root: str | Path, split: str = "train") -> list[str]:
@@ -96,6 +129,8 @@ def evaluate_model(
     device,
     conf_threshold: float = 0.25,
     iou_threshold: float = 0.7,
+    max_det: int = DEFAULT_MAX_DET,
+    report_thresholds=(0.05, 0.25, 0.50),
 ) -> dict:
     model.eval()
     losses = {"loss": 0.0, "box": 0.0, "cls": 0.0, "dfl": 0.0}
@@ -117,7 +152,7 @@ def evaluate_model(
         model.eval()
         pred, _ = model(images)
         all_predictions.extend(
-            non_max_suppression(pred, conf_threshold=conf_threshold, iou_threshold=iou_threshold)
+            non_max_suppression(pred, conf_threshold=conf_threshold, iou_threshold=iou_threshold, max_det=max_det)
         )
         all_targets.extend([{**target, "boxes": target["boxes"].cpu(), "labels": target["labels"].cpu()} for target in targets])
 
@@ -129,17 +164,50 @@ def evaluate_model(
         num_classes=model.head.num_classes,
         iou_threshold=0.5,
     )
-    return {**loss_metrics, **det_metrics}
+    threshold_metrics = {}
+    for threshold in report_thresholds:
+        filtered_predictions = filter_predictions_by_score(all_predictions, threshold)
+        metrics_at_threshold = detection_metrics(
+            filtered_predictions,
+            all_targets,
+            num_classes=model.head.num_classes,
+            iou_threshold=0.5,
+        )
+        suffix = f"@{threshold:g}"
+        threshold_metrics[f"precision{suffix}"] = metrics_at_threshold["precision"]
+        threshold_metrics[f"recall{suffix}"] = metrics_at_threshold["recall"]
+        threshold_metrics[f"num_predictions{suffix}"] = metrics_at_threshold["num_predictions"]
+
+    return {**loss_metrics, **det_metrics, **threshold_metrics}
 
 
-def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, classes: list[str], metrics: dict) -> None:
+def build_optimizer(model, lr: float, backbone_lr: float, weight_decay: float):
+    backbone_params = []
+    head_params = []
+    for name, param in model.named_parameters():
+        if name.startswith("backbone."):
+            backbone_params.append(param)
+        else:
+            head_params.append(param)
+
+    param_groups = []
+    if backbone_params:
+        param_groups.append({"params": backbone_params, "lr": backbone_lr, "name": "backbone"})
+    if head_params:
+        param_groups.append({"params": head_params, "lr": lr, "name": "head_neck"})
+    return AdamW(param_groups, weight_decay=weight_decay)
+
+
+def save_checkpoint(path: Path, model, epoch: int, classes: list[str], metrics: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    compact_state = {
+        key: value.detach().cpu().half() if torch.is_floating_point(value) else value.detach().cpu()
+        for key, value in model.state_dict().items()
+    }
     torch.save(
         {
             "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "model": compact_state,
             "classes": classes,
             "metrics": metrics,
         },
@@ -155,29 +223,40 @@ def parse_args() -> argparse.Namespace:
     #   excessive upscaling.
     # - Small/tiny objects are common, especially person/car/chair, so 320 is
     #   too lossy for this dataset.
-    # - CSPDarkNet53 is heavier than the previous scratch backbone; batch 4 is
-    #   a safer default, paired with a conservative LR.
+    # - CSPDarkNet53 is heavier than the previous scratch backbone. Batch 64 is
+    #   a practical server-GPU default; lower it if VRAM is tight.
     parser.add_argument("--img_size", type=int, default=DEFAULT_IMG_SIZE)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
+    parser.add_argument("--backbone_lr", type=float, default=DEFAULT_BACKBONE_LR)
     parser.add_argument("--weight_decay", type=float, default=DEFAULT_WEIGHT_DECAY)
     parser.add_argument("--output_dir", default="checkpoints")
+    parser.add_argument("--log_dir", default="logs")
     parser.add_argument("--conf_threshold", type=float, default=DEFAULT_CONF_THRESHOLD)
     parser.add_argument("--nms_iou", type=float, default=DEFAULT_NMS_IOU)
+    parser.add_argument("--max_det", type=int, default=DEFAULT_MAX_DET)
     parser.add_argument("--freeze_backbone_epochs", type=int, default=DEFAULT_FREEZE_BACKBONE_EPOCHS)
+    parser.add_argument("--early_stop_patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
+    parser.add_argument("--min_delta", type=float, default=DEFAULT_MIN_DELTA)
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--no_aug", action="store_true")
     parser.add_argument("--scratch_backbone", action="store_true")
-    parser.add_argument("--resume", type=str)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    logger, log_path = setup_logger(args.log_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     classes = load_classes(args.data_root)
+
+    logger.info("Starting training run")
+    logger.info("Log file: %s", log_path)
+    logger.info("Args: %s", json.dumps(vars(args), ensure_ascii=False, sort_keys=True))
+    logger.info("Device: %s", device)
+    logger.info("Classes (%d): %s", len(classes), ", ".join(classes))
 
     transforms = None if args.no_aug else albumentations_transform()
     train_loader = build_dataloader(
@@ -205,25 +284,33 @@ def main() -> None:
     criterion = YOLOv8Loss(num_classes=len(classes), strides=model.head.strides, reg_max=model.head.reg_max)
 
     set_backbone_trainable(model, args.freeze_backbone_epochs <= 0)
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1), eta_min=args.lr * 0.05)
+    optimizer = build_optimizer(
+        model,
+        lr=args.lr,
+        backbone_lr=args.backbone_lr,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=max(args.epochs, 1),
+        eta_min=min(args.lr, args.backbone_lr) * 0.05,
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and not args.no_amp))
-    start_epoch = 1
     best_map = -1.0
-
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        if checkpoint.get("scheduler"):
-            scheduler.load_state_dict(checkpoint["scheduler"])
-        start_epoch = int(checkpoint["epoch"]) + 1
-        best_map = float(checkpoint.get("metrics", {}).get("mAP50", -1.0))
+    best_epoch = 0
+    epochs_without_improvement = 0
+    logger.info(
+        "Optimizer groups: lr=%.6g backbone_lr=%.6g weight_decay=%.6g",
+        args.lr,
+        args.backbone_lr,
+        args.weight_decay,
+    )
 
     output_dir = Path(args.output_dir)
-    for epoch in range(start_epoch, args.epochs + 1):
+    for epoch in range(1, args.epochs + 1):
         if epoch == args.freeze_backbone_epochs + 1:
             set_backbone_trainable(model, True)
+            logger.info("Unfroze CSPDarkNet feature extractor at epoch %d", epoch)
 
         train_metrics = train_one_epoch(
             model, train_loader, criterion, optimizer, device, scaler, device.type == "cuda" and not args.no_amp, epoch
@@ -235,19 +322,66 @@ def main() -> None:
             device,
             conf_threshold=args.conf_threshold,
             iou_threshold=args.nms_iou,
+            max_det=args.max_det,
         )
         scheduler.step()
 
-        metrics = {**train_metrics, **val_metrics, "lr": scheduler.get_last_lr()[0]}
-        print(
-            f"epoch {epoch:03d}: loss={metrics['loss']:.4f} "
-            f"val_loss={metrics['val_loss']:.4f} mAP50={metrics['mAP50']:.4f} "
-            f"P={metrics['precision']:.4f} R={metrics['recall']:.4f}"
+        current_lrs = scheduler.get_last_lr()
+        metrics = {
+            **train_metrics,
+            **val_metrics,
+            "lr_backbone": current_lrs[0] if current_lrs else args.backbone_lr,
+            "lr": current_lrs[-1] if current_lrs else args.lr,
+        }
+        logger.info(
+            "epoch %03d/%03d | loss=%.4f box=%.4f cls=%.4f dfl=%.4f | "
+            "val_loss=%.4f mAP50=%.4f P@eval=%.4f R@eval=%.4f "
+            "P@0.25=%.4f R@0.25=%.4f P@0.50=%.4f R@0.50=%.4f preds@eval=%d | "
+            "lr_backbone=%.6g lr_head=%.6g",
+            epoch,
+            args.epochs,
+            metrics["loss"],
+            metrics["box"],
+            metrics["cls"],
+            metrics["dfl"],
+            metrics["val_loss"],
+            metrics["mAP50"],
+            metrics["precision"],
+            metrics["recall"],
+            metrics["precision@0.25"],
+            metrics["recall@0.25"],
+            metrics["precision@0.5"],
+            metrics["recall@0.5"],
+            metrics["num_predictions"],
+            metrics["lr_backbone"],
+            metrics["lr"],
         )
-        save_checkpoint(output_dir / "last.pth", model, optimizer, scheduler, epoch, classes, metrics)
-        if metrics["mAP50"] > best_map:
+        save_checkpoint(output_dir / "last.pth", model, epoch, classes, metrics)
+        if metrics["mAP50"] > best_map + args.min_delta:
             best_map = metrics["mAP50"]
-            save_checkpoint(output_dir / "best.pth", model, optimizer, scheduler, epoch, classes, metrics)
+            best_epoch = epoch
+            epochs_without_improvement = 0
+            save_checkpoint(output_dir / "best.pth", model, epoch, classes, metrics)
+            logger.info("Saved new best checkpoint: mAP50=%.6f at epoch %d", best_map, epoch)
+        else:
+            epochs_without_improvement += 1
+            logger.info(
+                "No mAP50 improvement for %d/%d epoch(s). Best mAP50=%.6f at epoch %d",
+                epochs_without_improvement,
+                args.early_stop_patience,
+                best_map,
+                best_epoch,
+            )
+            if args.early_stop_patience > 0 and epochs_without_improvement >= args.early_stop_patience:
+                logger.info(
+                    "Early stopping at epoch %d. Best mAP50=%.6f at epoch %d",
+                    epoch,
+                    best_map,
+                    best_epoch,
+                )
+                break
+
+    logger.info("Training finished. Best mAP50: %.6f", best_map)
 
 
 if __name__ == "__main__":

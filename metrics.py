@@ -62,6 +62,23 @@ def non_max_suppression(
     return results
 
 
+def filter_predictions_by_score(
+    predictions: list[dict[str, torch.Tensor]],
+    score_threshold: float,
+) -> list[dict[str, torch.Tensor]]:
+    filtered = []
+    for pred in predictions:
+        keep = pred["scores"] >= score_threshold
+        filtered.append(
+            {
+                "boxes": pred["boxes"][keep],
+                "scores": pred["scores"][keep],
+                "labels": pred["labels"][keep],
+            }
+        )
+    return filtered
+
+
 def compute_ap(recalls: list[float], precisions: list[float]) -> float:
     if not recalls:
         return 0.0
@@ -158,5 +175,7 @@ def detection_metrics(
         "mAP50": sum(aps) / len(aps) if aps else 0.0,
         "precision": total_tp / max(total_tp + total_fp, 1),
         "recall": total_tp / total_gt if total_gt else 0.0,
+        "num_predictions": sum(len(items) for items in pred_by_class.values()),
+        "num_ground_truth": total_gt,
         "per_class": per_class,
     }
