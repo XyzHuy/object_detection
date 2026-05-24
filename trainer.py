@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,10 @@ DEFAULT_MIN_DELTA = 1e-4
 DEFAULT_CONF_THRESHOLD = 0.001
 DEFAULT_NMS_IOU = 0.65
 DEFAULT_MAX_DET = 100
+DEFAULT_LOCAL_JEPA_ALPHA = 0.2
+DEFAULT_LOCAL_JEPA_FINAL_ALPHA = 0.05
+DEFAULT_LOCAL_JEPA_WARMUP_EPOCHS = 5
+DEFAULT_LOCAL_JEPA_DECAY_START_EPOCH = 50
 
 
 def setup_logger(log_dir: str | Path) -> tuple[logging.Logger, Path]:
@@ -80,6 +85,31 @@ def set_backbone_trainable(model: torch.nn.Module, trainable: bool) -> None:
         backbone.set_feature_extractor_trainable(trainable)
 
 
+def local_jepa_alpha_for_epoch(
+    epoch: int,
+    total_epochs: int,
+    peak_alpha: float,
+    final_alpha: float,
+    warmup_epochs: int,
+    decay_start_epoch: int,
+) -> float:
+    if peak_alpha <= 0.0:
+        return 0.0
+
+    warmup_epochs = max(int(warmup_epochs), 0)
+    if warmup_epochs > 0 and epoch <= warmup_epochs:
+        return peak_alpha * max(epoch - 1, 0) / warmup_epochs
+
+    decay_start_epoch = max(int(decay_start_epoch), 1)
+    if epoch < decay_start_epoch or decay_start_epoch >= total_epochs:
+        return peak_alpha
+
+    progress = (epoch - decay_start_epoch) / max(total_epochs - decay_start_epoch, 1)
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return final_alpha + (peak_alpha - final_alpha) * cosine
+
+
 def train_one_epoch(
     model,
     loader,
@@ -91,7 +121,7 @@ def train_one_epoch(
     epoch: int,
 ) -> dict:
     model.train()
-    running = {"loss": 0.0, "box": 0.0, "cls": 0.0, "dfl": 0.0}
+    running = {"loss": 0.0, "box": 0.0, "cls": 0.0, "dfl": 0.0, "jepa": 0.0}
     progress = tqdm(loader, desc=f"train {epoch}", leave=False)
 
     for images, targets in progress:
@@ -114,6 +144,7 @@ def train_one_epoch(
         running["box"] += float(loss_items.box_loss) * batch_size
         running["cls"] += float(loss_items.cls_loss) * batch_size
         running["dfl"] += float(loss_items.dfl_loss) * batch_size
+        running["jepa"] += float(loss_items.local_jepa_loss) * batch_size
         seen = max(progress.n + 1, 1) * batch_size
         progress.set_postfix({key: value / seen for key, value in running.items()})
 
@@ -133,7 +164,7 @@ def evaluate_model(
     report_thresholds=(0.05, 0.25, 0.50),
 ) -> dict:
     model.eval()
-    losses = {"loss": 0.0, "box": 0.0, "cls": 0.0, "dfl": 0.0}
+    losses = {"loss": 0.0, "box": 0.0, "cls": 0.0, "dfl": 0.0, "jepa": 0.0}
     all_predictions = []
     all_targets = []
 
@@ -148,6 +179,7 @@ def evaluate_model(
         losses["box"] += float(loss_items.box_loss) * batch_size
         losses["cls"] += float(loss_items.cls_loss) * batch_size
         losses["dfl"] += float(loss_items.dfl_loss) * batch_size
+        losses["jepa"] += float(loss_items.local_jepa_loss) * batch_size
 
         model.eval()
         pred, _ = model(images)
@@ -203,6 +235,7 @@ def save_checkpoint(path: Path, model, epoch: int, classes: list[str], metrics: 
     compact_state = {
         key: value.detach().cpu().half() if torch.is_floating_point(value) else value.detach().cpu()
         for key, value in model.state_dict().items()
+        if not key.startswith("local_jepa.")
     }
     torch.save(
         {
@@ -218,17 +251,10 @@ def save_checkpoint(path: Path, model, epoch: int, classes: list[str], metrics: 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Train YOLOv8 with ImageNet-pretrained CSPDarkNet backbone")
     parser.add_argument("--data_root", default="final_public/public")
-    # Dataset-informed defaults:
-    # - Images are mostly <= 500px on the long edge, so 512 keeps detail without
-    #   excessive upscaling.
-    # - Small/tiny objects are common, especially person/car/chair, so 320 is
-    #   too lossy for this dataset.
-    # - CSPDarkNet53 is heavier than the previous scratch backbone. Batch 64 is
-    #   a practical server-GPU default; lower it if VRAM is tight.
     parser.add_argument("--img_size", type=int, default=DEFAULT_IMG_SIZE)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=6)
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--backbone_lr", type=float, default=DEFAULT_BACKBONE_LR)
     parser.add_argument("--weight_decay", type=float, default=DEFAULT_WEIGHT_DECAY)
@@ -240,6 +266,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--freeze_backbone_epochs", type=int, default=DEFAULT_FREEZE_BACKBONE_EPOCHS)
     parser.add_argument("--early_stop_patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
     parser.add_argument("--min_delta", type=float, default=DEFAULT_MIN_DELTA)
+    parser.add_argument("--use_local_jepa", action="store_true")
+    parser.add_argument("--local_jepa_alpha", type=float, default=DEFAULT_LOCAL_JEPA_ALPHA)
+    parser.add_argument("--local_jepa_final_alpha", type=float, default=DEFAULT_LOCAL_JEPA_FINAL_ALPHA)
+    parser.add_argument("--local_jepa_warmup_epochs", type=int, default=DEFAULT_LOCAL_JEPA_WARMUP_EPOCHS)
+    parser.add_argument("--local_jepa_decay_start_epoch", type=int, default=DEFAULT_LOCAL_JEPA_DECAY_START_EPOCH)
+    parser.add_argument("--no_local_jepa_alpha_schedule", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--no_aug", action="store_true")
     parser.add_argument("--scratch_backbone", action="store_true")
@@ -280,8 +312,14 @@ def main() -> None:
         num_classes=len(classes),
         pretrained_backbone=not args.scratch_backbone,
         use_cspdarknet=not args.scratch_backbone,
+        use_local_jepa=args.use_local_jepa,
     ).to(device)
-    criterion = YOLOv8Loss(num_classes=len(classes), strides=model.head.strides, reg_max=model.head.reg_max)
+    criterion = YOLOv8Loss(
+        num_classes=len(classes),
+        strides=model.head.strides,
+        reg_max=model.head.reg_max,
+        local_jepa_gain=0.0,
+    )
 
     set_backbone_trainable(model, args.freeze_backbone_epochs <= 0)
     optimizer = build_optimizer(
@@ -305,12 +343,43 @@ def main() -> None:
         args.backbone_lr,
         args.weight_decay,
     )
+    if args.use_local_jepa:
+        if args.local_jepa_alpha < 0:
+            raise ValueError("--local_jepa_alpha must be non-negative")
+        if args.local_jepa_final_alpha < 0:
+            raise ValueError("--local_jepa_final_alpha must be non-negative")
+        if args.local_jepa_final_alpha > args.local_jepa_alpha:
+            raise ValueError("--local_jepa_final_alpha must be <= --local_jepa_alpha")
+        logger.info(
+            "Local JEPA enabled: peak_alpha=%.6g final_alpha=%.6g warmup_epochs=%d "
+            "decay_start_epoch=%d schedule=%s",
+            args.local_jepa_alpha,
+            args.local_jepa_final_alpha,
+            args.local_jepa_warmup_epochs,
+            args.local_jepa_decay_start_epoch,
+            not args.no_local_jepa_alpha_schedule,
+        )
 
     output_dir = Path(args.output_dir)
     for epoch in range(1, args.epochs + 1):
         if epoch == args.freeze_backbone_epochs + 1:
             set_backbone_trainable(model, True)
             logger.info("Unfroze CSPDarkNet feature extractor at epoch %d", epoch)
+
+        local_jepa_alpha = 0.0
+        if args.use_local_jepa:
+            if args.no_local_jepa_alpha_schedule:
+                local_jepa_alpha = args.local_jepa_alpha
+            else:
+                local_jepa_alpha = local_jepa_alpha_for_epoch(
+                    epoch=epoch,
+                    total_epochs=args.epochs,
+                    peak_alpha=args.local_jepa_alpha,
+                    final_alpha=args.local_jepa_final_alpha,
+                    warmup_epochs=args.local_jepa_warmup_epochs,
+                    decay_start_epoch=args.local_jepa_decay_start_epoch,
+                )
+            criterion.local_jepa_gain = local_jepa_alpha
 
         train_metrics = train_one_epoch(
             model, train_loader, criterion, optimizer, device, scaler, device.type == "cuda" and not args.no_amp, epoch
@@ -332,9 +401,10 @@ def main() -> None:
             **val_metrics,
             "lr_backbone": current_lrs[0] if current_lrs else args.backbone_lr,
             "lr": current_lrs[-1] if current_lrs else args.lr,
+            "local_jepa_alpha": local_jepa_alpha,
         }
         logger.info(
-            "epoch %03d/%03d | loss=%.4f box=%.4f cls=%.4f dfl=%.4f | "
+            "epoch %03d/%03d | loss=%.4f box=%.4f cls=%.4f dfl=%.4f jepa=%.4f alpha_jepa=%.4f | "
             "val_loss=%.4f mAP50=%.4f P@eval=%.4f R@eval=%.4f "
             "P@0.25=%.4f R@0.25=%.4f P@0.50=%.4f R@0.50=%.4f preds@eval=%d | "
             "lr_backbone=%.6g lr_head=%.6g",
@@ -344,6 +414,8 @@ def main() -> None:
             metrics["box"],
             metrics["cls"],
             metrics["dfl"],
+            metrics["jepa"],
+            metrics["local_jepa_alpha"],
             metrics["val_loss"],
             metrics["mAP50"],
             metrics["precision"],

@@ -59,6 +59,7 @@ class YOLOv8LossItems:
     box_loss: torch.Tensor
     cls_loss: torch.Tensor
     dfl_loss: torch.Tensor
+    local_jepa_loss: torch.Tensor
 
 
 class YOLOv8Loss(nn.Module):
@@ -73,6 +74,7 @@ class YOLOv8Loss(nn.Module):
         box_gain: float = 7.5,
         cls_gain: float = 0.5,
         dfl_gain: float = 1.5,
+        local_jepa_gain: float = 0.0,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -84,6 +86,7 @@ class YOLOv8Loss(nn.Module):
         self.box_gain = box_gain
         self.cls_gain = cls_gain
         self.dfl_gain = dfl_gain
+        self.local_jepa_gain = local_jepa_gain
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
 
     def forward(self, outputs: dict, targets: list[dict]) -> YOLOv8LossItems:
@@ -132,8 +135,29 @@ class YOLOv8Loss(nn.Module):
             box_loss = box_raw.sum() * 0.0
             dfl_loss = box_raw.sum() * 0.0
 
-        total = self.box_gain * box_loss + self.cls_gain * cls_loss + self.dfl_gain * dfl_loss
-        return YOLOv8LossItems(total, box_loss.detach(), cls_loss.detach(), dfl_loss.detach())
+        local_jepa_loss = self._local_jepa_loss(outputs, box_raw)
+        total = (
+            self.box_gain * box_loss
+            + self.cls_gain * cls_loss
+            + self.dfl_gain * dfl_loss
+            + self.local_jepa_gain * local_jepa_loss
+        )
+        return YOLOv8LossItems(
+            total,
+            box_loss.detach(),
+            cls_loss.detach(),
+            dfl_loss.detach(),
+            local_jepa_loss.detach(),
+        )
+
+    @staticmethod
+    def _local_jepa_loss(outputs: dict, reference: torch.Tensor) -> torch.Tensor:
+        local_jepa = outputs.get("local_jepa")
+        if local_jepa is None:
+            return reference.sum() * 0.0
+        if isinstance(local_jepa, dict):
+            return local_jepa["loss"]
+        return local_jepa
 
     def _dfl_decode(self, box_raw: torch.Tensor) -> torch.Tensor:
         b, _, n = box_raw.shape

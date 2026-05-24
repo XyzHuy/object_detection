@@ -50,6 +50,7 @@ def load_model(checkpoint_path: str | Path, num_classes: int, device: torch.devi
     model = YOLOv8Scratch(num_classes=num_classes, pretrained_backbone=False, use_cspdarknet=True)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    state = {key: value for key, value in state.items() if not key.startswith("local_jepa.")}
     model.load_state_dict(state)
     model.to(device).eval()
     return model, checkpoint if isinstance(checkpoint, dict) else {}
