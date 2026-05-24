@@ -26,7 +26,6 @@ class YOLOv8Scratch(nn.Module):
         else:
             self.backbone = YOLOv8Backbone()
         self.neck = YOLOv8Neck()
-        self.local_jepa = LocalJEPABranch() if use_local_jepa else None
 
         self.head = YOLOv8DetectHead(
             num_classes=num_classes,
@@ -34,6 +33,7 @@ class YOLOv8Scratch(nn.Module):
             reg_max=16,
             strides=(8, 16, 32),
         )
+        self.local_jepa = LocalJEPABranch() if use_local_jepa else None
 
     def forward(self, x):
         backbone_features = self.backbone(x)
