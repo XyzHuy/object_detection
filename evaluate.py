@@ -13,7 +13,7 @@ import torch
 from dataloader import build_dataloader
 from inference import collect_images, load_annotation_index, load_model, predict_image
 from loss import YOLOv8Loss
-from trainer import evaluate_model, experiment_name, load_classes, run_dir
+from trainer import evaluate_model, load_classes, run_dir
 
 
 def setup_eval_logger(log_dir: str | Path, checkpoint: str | Path) -> tuple[logging.Logger, Path]:
@@ -57,7 +57,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nms_iou", type=float, default=0.65)
     parser.add_argument("--max_det", type=int, default=100)
     parser.add_argument("--log_dir", default="logs")
-    parser.add_argument("--use_local_jepa", action="store_true")
     parser.add_argument("--num_runs", type=int, default=1)
     parser.add_argument("--predictions_output")
     parser.add_argument("--metrics_output")
@@ -254,7 +253,7 @@ def main() -> None:
     if args.num_runs < 1:
         raise ValueError("--num_runs must be >= 1")
 
-    experiment = experiment_name(args.use_local_jepa)
+    experiment = "base"
     checkpoints = []
     if args.checkpoint:
         checkpoints.append((0, Path(args.checkpoint)))
@@ -285,6 +284,4 @@ if __name__ == "__main__":
     main()
 
 # python3 evaluate.py
-# python3 evaluate.py --use_local_jepa
 # python3 evaluate.py --num_runs 3
-# python3 evaluate.py --use_local_jepa --num_runs 3
