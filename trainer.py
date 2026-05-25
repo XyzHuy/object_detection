@@ -38,6 +38,15 @@ DEFAULT_LOCAL_JEPA_FINAL_ALPHA = 0.05
 DEFAULT_LOCAL_JEPA_WARMUP_EPOCHS = 5
 DEFAULT_LOCAL_JEPA_DECAY_START_EPOCH = 50
 DEFAULT_SEED = 42
+DEFAULT_NUM_RUNS = 1
+
+
+def experiment_name(use_local_jepa: bool) -> str:
+    return "local_JEPA" if use_local_jepa else "base"
+
+
+def run_dir(root: str | Path, experiment: str, run_idx: int) -> Path:
+    return Path(root) / experiment / f"run_{run_idx}"
 
 def setup_logger(log_dir: str | Path) -> tuple[logging.Logger, Path]:
     log_dir = Path(log_dir)
@@ -46,7 +55,9 @@ def setup_logger(log_dir: str | Path) -> tuple[logging.Logger, Path]:
 
     logger = logging.getLogger("trainer")
     logger.setLevel(logging.INFO)
-    logger.handlers.clear()
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
     logger.propagate = False
 
     formatter = logging.Formatter(
@@ -285,6 +296,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local_jepa_warmup_epochs", type=int, default=DEFAULT_LOCAL_JEPA_WARMUP_EPOCHS)
     parser.add_argument("--local_jepa_decay_start_epoch", type=int, default=DEFAULT_LOCAL_JEPA_DECAY_START_EPOCH)
     parser.add_argument("--no_local_jepa_alpha_schedule", action="store_true")
+    parser.add_argument("--num_runs", type=int, default=DEFAULT_NUM_RUNS)
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--no_aug", action="store_true")
     parser.add_argument("--scratch_backbone", action="store_true")
@@ -293,19 +305,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    logger, log_path = setup_logger(args.log_dir)
+def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, log_dir: Path) -> None:
+    logger, log_path = setup_logger(log_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     classes = load_classes(args.data_root)
+    run_seed = args.seed + run_idx if args.seed >= 0 else None
 
-    logger.info("Starting training run")
+    logger.info("Starting training run %d/%d", run_idx + 1, args.num_runs)
     logger.info("Log file: %s", log_path)
+    logger.info("Output dir: %s", output_dir)
     logger.info("Args: %s", json.dumps(vars(args), ensure_ascii=False, sort_keys=True))
     logger.info("Device: %s", device)
     logger.info("Classes (%d): %s", len(classes), ", ".join(classes))
+    logger.info("Run index: %d", run_idx)
 
-    run_seed = args.seed if args.seed >= 0 else None
     if run_seed is not None:
         set_seed(run_seed, deterministic=args.deterministic)
         logger.info("Seed: %d deterministic=%s", run_seed, args.deterministic)
@@ -383,7 +396,6 @@ def main() -> None:
             not args.no_local_jepa_alpha_schedule,
         )
 
-    output_dir = Path(args.output_dir)
     for epoch in range(1, args.epochs + 1):
         if epoch == args.freeze_backbone_epochs + 1:
             set_backbone_trainable(model, True)
@@ -425,6 +437,9 @@ def main() -> None:
             "lr_backbone": current_lrs[0] if current_lrs else args.backbone_lr,
             "lr": current_lrs[-1] if current_lrs else args.lr,
             "local_jepa_alpha": local_jepa_alpha,
+            "run": run_idx,
+            "seed": run_seed,
+            "experiment": experiment_name(args.use_local_jepa),
         }
         logger.info(
             "epoch %03d/%03d | loss=%.4f box=%.4f cls=%.4f dfl=%.4f jepa=%.4f alpha_jepa=%.4f | "
@@ -479,9 +494,28 @@ def main() -> None:
     logger.info("Training finished. Best mAP50: %.6f", best_map)
 
 
+def main() -> None:
+    args = parse_args()
+    if args.num_runs < 1:
+        raise ValueError("--num_runs must be >= 1")
+
+    experiment = experiment_name(args.use_local_jepa)
+    for run_idx in range(args.num_runs):
+        train_single_run(
+            args=args,
+            run_idx=run_idx,
+            output_dir=run_dir(args.output_dir, experiment, run_idx),
+            log_dir=run_dir(args.log_dir, experiment, run_idx),
+        )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 if __name__ == "__main__":
     main()
 
 
-# python3 train.py --use_local_jepa --output_dir checkpoints/local_JEPA --log_dir logs/local_JEPA
-# python3 train.py --output_dir checkpoints/base --log_dir logs/base
+# python3 train.py
+# python3 train.py --use_local_jepa
+# python3 train.py --num_runs 3
+# python3 train.py --use_local_jepa --num_runs 3
