@@ -71,6 +71,51 @@ def load_annotation_index(data_root: str | Path, split: str) -> dict[str, dict]:
     return {Path(item["file_name"]).name: item for item in data["images"]}
 
 
+def load_class_thresholds(spec: str | Path | None, classes: list[str]) -> dict[str, float] | None:
+    if not spec:
+        return None
+
+    spec_text = str(spec)
+    path = Path(spec_text)
+    if path.exists():
+        data = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        data = {}
+        for item in spec_text.split(","):
+            if not item.strip():
+                continue
+            if "=" not in item:
+                raise ValueError(
+                    "--class_thresholds must be a JSON file or comma-separated class=value pairs"
+                )
+            class_name, value = item.split("=", 1)
+            data[class_name.strip()] = float(value)
+
+    if isinstance(data, dict) and "thresholds" in data:
+        data = data["thresholds"]
+
+    if isinstance(data, list):
+        if len(data) != len(classes):
+            raise ValueError(
+                f"Threshold list length {len(data)} does not match {len(classes)} classes"
+            )
+        data = dict(zip(classes, data))
+
+    if not isinstance(data, dict):
+        raise ValueError("Class thresholds must be a dict, a list, or a dict with a 'thresholds' field")
+
+    class_set = set(classes)
+    thresholds = {}
+    for class_name, value in data.items():
+        if class_name not in class_set:
+            raise ValueError(f"Unknown class in thresholds: {class_name}")
+        threshold = float(value)
+        if threshold < 0 or threshold > 1:
+            raise ValueError(f"Invalid threshold for {class_name}: {threshold}")
+        thresholds[class_name] = threshold
+    return thresholds
+
+
 @torch.no_grad()
 def predict_image(
     model,
@@ -81,6 +126,7 @@ def predict_image(
     conf_threshold: float,
     iou_threshold: float,
     max_det: int,
+    class_thresholds: dict[str, float] | None = None,
 ) -> dict:
     image = Image.open(image_path).convert("RGB")
     tensor, meta = preprocess(image, img_size, device)
@@ -90,13 +136,17 @@ def predict_image(
 
     output_boxes = []
     for box, score, label in zip(boxes, detections["scores"].cpu(), detections["labels"].cpu()):
+        class_name = classes[int(label)]
+        confidence = float(score)
+        if class_thresholds is not None and confidence < class_thresholds.get(class_name, conf_threshold):
+            continue
         x1, y1, x2, y2 = [float(v) for v in box.tolist()]
         if x2 <= x1 or y2 <= y1:
             continue
         output_boxes.append(
             {
-                "class": classes[int(label)],
-                "confidence": float(score),
+                "class": class_name,
+                "confidence": confidence,
                 "bbox": [x1, y1, x2, y2],
             }
         )
@@ -112,6 +162,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="val")
     parser.add_argument("--img_size", type=int, default=512)
     parser.add_argument("--conf_threshold", type=float, default=0.001)
+    parser.add_argument(
+        "--class_thresholds",
+        help="JSON file or comma-separated class=value pairs. Keep --conf_threshold <= the minimum class threshold.",
+    )
     parser.add_argument("--nms_iou", type=float, default=0.65)
     parser.add_argument("--max_det", type=int, default=100)
     return parser.parse_args()
@@ -127,6 +181,7 @@ def main() -> None:
             classes = json.load(file)["classes"]
 
     model, _ = load_model(args.checkpoint, len(classes), device)
+    class_thresholds = load_class_thresholds(args.class_thresholds, classes)
     annotation_index = load_annotation_index(args.data_root, args.split)
     predictions = []
 
@@ -140,6 +195,7 @@ def main() -> None:
             args.conf_threshold,
             args.nms_iou,
             args.max_det,
+            class_thresholds=class_thresholds,
         )
         result["image_id"] = annotation_index.get(image_path.name, {}).get("id", image_path.name)
         predictions.append(result)
