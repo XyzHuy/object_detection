@@ -82,10 +82,7 @@ def load_classes(data_root: str | Path, split: str = "train") -> list[str]:
 def compute_class_weights(
     data_root: str | Path,
     classes: list[str],
-    split: str,
-    scheme: str,
-    max_weight: float,
-    beta: float,
+    split: str = "train",
 ) -> tuple[torch.Tensor, dict[str, int]]:
     annotation_path = Path(data_root) / "annotations" / f"{split}.json"
     with annotation_path.open("r", encoding="utf-8") as file:
@@ -99,22 +96,8 @@ def compute_class_weights(
 
     counts = torch.tensor([counts_by_class[class_name] for class_name in classes], dtype=torch.float32)
     safe_counts = counts.clamp(min=1.0)
-    if scheme == "none":
-        weights = torch.ones_like(safe_counts)
-    elif scheme == "inverse":
-        weights = 1.0 / safe_counts
-    elif scheme == "sqrt_inverse":
-        weights = 1.0 / safe_counts.sqrt()
-    elif scheme == "effective":
-        if beta <= 0 or beta >= 1:
-            raise ValueError("--class_weight_beta must be in (0, 1)")
-        weights = (1.0 - beta) / (1.0 - torch.pow(torch.full_like(safe_counts, beta), safe_counts))
-    else:
-        raise ValueError(f"Unknown class weighting scheme: {scheme}")
-
+    weights = 1.0 / safe_counts.sqrt()
     weights = weights / weights.mean().clamp(min=1e-12)
-    if max_weight > 0:
-        weights = weights.clamp(max=max_weight)
     return weights, counts_by_class
 
 
@@ -296,38 +279,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_det", type=int, default=DEFAULT_MAX_DET)
     parser.add_argument(
         "--class_weighting",
-        choices=("none", "sqrt_inverse", "inverse", "effective"),
-        default="none",
-        help="Weight positive classification loss by class frequency from the train split.",
-    )
-    parser.add_argument(
-        "--class_weight_max",
-        type=float,
-        default=3.0,
-        help="Cap class weights after normalization. Set <=0 to disable capping.",
-    )
-    parser.add_argument(
-        "--class_weight_beta",
-        type=float,
-        default=0.999,
-        help="Beta for effective-number class weighting.",
-    )
-    parser.add_argument(
-        "--class_weight_box",
-        action="store_true",
-        help="Also weight box and DFL losses for foreground anchors by class.",
-    )
-    parser.add_argument(
-        "--balanced_sampling",
-        choices=("none", "sqrt_inverse", "inverse", "effective"),
-        default="none",
-        help="Use a weighted image sampler for train images containing rare classes.",
-    )
-    parser.add_argument(
-        "--empty_sample_weight",
-        type=float,
-        default=0.25,
-        help="Relative sampling weight for images with no boxes when balanced sampling is enabled.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use sqrt-inverse class weights from the train split for positive classification loss.",
     )
     parser.add_argument("--freeze_backbone_epochs", type=int, default=DEFAULT_FREEZE_BACKBONE_EPOCHS)
     parser.add_argument("--early_stop_patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
@@ -366,11 +320,6 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         logger.info("Seed: %d deterministic=%s", run_seed, args.deterministic)
     else:
         logger.info("Seed: disabled")
-    logger.info(
-        "Balanced sampling: scheme=%s empty_sample_weight=%.4g",
-        args.balanced_sampling,
-        args.empty_sample_weight,
-    )
     transforms = None if args.no_aug else albumentations_transform()
     train_loader = build_dataloader(
         args.data_root,
@@ -380,8 +329,6 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         transforms=transforms,
         img_size=args.img_size,
         seed=run_seed,
-        balanced_sampling=args.balanced_sampling,
-        empty_sample_weight=args.empty_sample_weight,
     )
     val_loader = build_dataloader(
         args.data_root,
@@ -402,17 +349,13 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         data_root=args.data_root,
         classes=classes,
         split="train",
-        scheme=args.class_weighting,
-        max_weight=args.class_weight_max,
-        beta=args.class_weight_beta,
     )
+    if not args.class_weighting:
+        class_weights = torch.ones_like(class_weights)
     logger.info("Train class counts: %s", json.dumps(class_counts, ensure_ascii=False, sort_keys=True))
     logger.info(
-        "Class weighting: scheme=%s max=%.4g beta=%.6g box=%s weights=%s",
+        "Class weighting: enabled=%s scheme=sqrt_inverse weights=%s",
         args.class_weighting,
-        args.class_weight_max,
-        args.class_weight_beta,
-        args.class_weight_box,
         json.dumps({class_name: round(float(weight), 6) for class_name, weight in zip(classes, class_weights)}),
     )
     criterion = YOLOv8Loss(
@@ -420,7 +363,6 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         strides=model.head.strides,
         reg_max=model.head.reg_max,
         class_weights=class_weights,
-        class_weight_box=args.class_weight_box,
     )
 
     set_backbone_trainable(model, args.freeze_backbone_epochs <= 0)
