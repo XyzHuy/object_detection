@@ -73,6 +73,8 @@ class YOLOv8Loss(nn.Module):
         box_gain: float = 7.5,
         cls_gain: float = 0.5,
         dfl_gain: float = 1.5,
+        class_weights: torch.Tensor | list[float] | None = None,
+        class_weight_box: bool = False,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -84,6 +86,14 @@ class YOLOv8Loss(nn.Module):
         self.box_gain = box_gain
         self.cls_gain = cls_gain
         self.dfl_gain = dfl_gain
+        self.class_weight_box = class_weight_box
+        if class_weights is None:
+            weights = torch.ones(num_classes, dtype=torch.float32)
+        else:
+            weights = torch.as_tensor(class_weights, dtype=torch.float32)
+            if weights.numel() != num_classes:
+                raise ValueError(f"Expected {num_classes} class weights, got {weights.numel()}")
+        self.register_buffer("class_weights", weights.view(1, 1, num_classes))
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
 
     def forward(self, outputs: dict, targets: list[dict]) -> YOLOv8LossItems:
@@ -114,10 +124,13 @@ class YOLOv8Loss(nn.Module):
         )
         target_scores_sum = target_scores.sum().clamp(min=1.0)
 
-        cls_loss = self.bce(cls_logits, target_scores).sum() / target_scores_sum
+        cls_weight = torch.where(target_scores > 0, self.class_weights.to(device), 1.0)
+        cls_loss = (self.bce(cls_logits, target_scores) * cls_weight).sum() / target_scores_sum
 
         if fg_mask.any():
             weight = target_scores.sum(dim=-1)[fg_mask]
+            if self.class_weight_box:
+                weight = (target_scores * self.class_weights.to(device)).sum(dim=-1)[fg_mask]
             box_loss = ((1.0 - bbox_ciou(pred_boxes[fg_mask], target_boxes[fg_mask])) * weight).sum()
             box_loss = box_loss / target_scores_sum
 
