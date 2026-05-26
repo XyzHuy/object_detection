@@ -47,6 +47,11 @@ def setup_eval_logger(log_dir: str | Path, checkpoint: str | Path) -> tuple[logg
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Evaluate a trained YOLOv8 checkpoint")
     parser.add_argument("--checkpoint")
+    parser.add_argument(
+        "--checkpoint_name",
+        default="best",
+        help="Checkpoint filename stem to evaluate when --checkpoint is not set, e.g. best or alter_best.",
+    )
     parser.add_argument("--checkpoint_root", default="checkpoints")
     parser.add_argument("--data_root", default="final_public/public")
     parser.add_argument("--split", default="val")
@@ -104,9 +109,9 @@ def run_official_evaluator(
     return result
 
 
-def default_checkpoint_path(checkpoint_root: str | Path, experiment: str, run_idx: int) -> Path:
-    checkpoint = Path(checkpoint_root) / experiment / f"run_{run_idx}" / "best.pth"
-    legacy_checkpoint = Path(checkpoint_root) / experiment / "best.pth"
+def default_checkpoint_path(checkpoint_root: str | Path, experiment: str, run_idx: int, checkpoint_name: str) -> Path:
+    checkpoint = Path(checkpoint_root) / experiment / f"run_{run_idx}" / f"{checkpoint_name}.pth"
+    legacy_checkpoint = Path(checkpoint_root) / experiment / f"{checkpoint_name}.pth"
     if checkpoint.exists() or run_idx != 0:
         return checkpoint
     return legacy_checkpoint
@@ -253,13 +258,24 @@ def main() -> None:
     if args.num_runs < 1:
         raise ValueError("--num_runs must be >= 1")
 
-    experiment = "base"
+    checkpoint_experiment = "base"
+    experiment = "base" if args.checkpoint_name == "best" else f"base_{args.checkpoint_name}"
     checkpoints = []
     if args.checkpoint:
         checkpoints.append((0, Path(args.checkpoint)))
     else:
         for run_idx in range(args.num_runs):
-            checkpoints.append((run_idx, default_checkpoint_path(args.checkpoint_root, experiment, run_idx)))
+            checkpoints.append(
+                (
+                    run_idx,
+                    default_checkpoint_path(
+                        args.checkpoint_root,
+                        checkpoint_experiment,
+                        run_idx,
+                        args.checkpoint_name,
+                    ),
+                )
+            )
 
     summaries = []
     for run_idx, checkpoint_path in checkpoints:

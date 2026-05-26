@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from pathlib import Path
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from typing import Optional, Callable, List, Tuple, Dict
 import torchvision.transforms.functional as trans_func
 import torchvision.transforms as trans
@@ -159,6 +159,41 @@ def seed_worker(worker_id: int) -> None:
     random.seed(worker_seed)
 
 
+def image_sample_weights(
+    dataset: CustomDataset,
+    scheme: str,
+    empty_weight: float = 0.25,
+) -> torch.Tensor:
+    counts = torch.zeros(len(dataset.classes), dtype=torch.float32)
+    image_label_sets = []
+    for image_info in dataset.images:
+        anns = dataset.ann_by_image_id.get(image_info["id"], [])
+        labels = {dataset.class_to_idx[ann["class"]] for ann in anns}
+        image_label_sets.append(labels)
+        for ann in anns:
+            counts[dataset.class_to_idx[ann["class"]]] += 1
+
+    safe_counts = counts.clamp(min=1.0)
+    if scheme == "inverse":
+        class_weights = 1.0 / safe_counts
+    elif scheme == "sqrt_inverse":
+        class_weights = 1.0 / safe_counts.sqrt()
+    elif scheme == "effective":
+        beta = 0.999
+        class_weights = (1.0 - beta) / (1.0 - torch.pow(torch.full_like(safe_counts, beta), safe_counts))
+    else:
+        raise ValueError(f"Unknown balanced sampling scheme: {scheme}")
+
+    class_weights = class_weights / class_weights.mean().clamp(min=1e-12)
+    weights = []
+    for labels in image_label_sets:
+        if not labels:
+            weights.append(float(empty_weight))
+            continue
+        weights.append(float(class_weights[list(labels)].max()))
+    return torch.tensor(weights, dtype=torch.double).clamp(min=1e-12)
+
+
 # Build dataloader
 
 
@@ -173,6 +208,8 @@ def build_dataloader(
     drop_last: bool = False,
     img_size: int = 512,
     seed: Optional[int] = None,
+    balanced_sampling: str = "none",
+    empty_sample_weight: float = 0.25,
 ) -> DataLoader:
 
     dataset = CustomDataset(
@@ -183,16 +220,27 @@ def build_dataloader(
         img_size=img_size,
     )
 
-    shuffle = (split == "train")
     generator = None
     if seed is not None:
         generator = torch.Generator()
         generator.manual_seed(seed)
 
+    sampler = None
+    shuffle = (split == "train")
+    if split == "train" and balanced_sampling != "none":
+        sampler = WeightedRandomSampler(
+            weights=image_sample_weights(dataset, balanced_sampling, empty_sample_weight),
+            num_samples=len(dataset),
+            replacement=True,
+            generator=generator,
+        )
+        shuffle = False
+
     loader = DataLoader(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=pin_memory and torch.cuda.is_available(),
