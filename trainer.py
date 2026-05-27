@@ -295,6 +295,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_runs", type=int, default=DEFAULT_NUM_RUNS)
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--no_aug", action="store_true")
+    parser.add_argument(
+        "--box_type_equalizer",
+        action="store_true",
+        help="Scale train images to synthesize under-represented box-size buckets per class before Albumentations.",
+    )
     parser.add_argument("--scratch_backbone", action="store_true")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Set to -1 to disable fixed seeding.")
     parser.add_argument("--deterministic", action="store_true", help="Use deterministic PyTorch kernels when available.")
@@ -329,7 +334,15 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         transforms=transforms,
         img_size=args.img_size,
         seed=run_seed,
+        box_type_equalizer=args.box_type_equalizer,
     )
+    if args.box_type_equalizer:
+        equalizer = getattr(train_loader.dataset, "box_type_equalizer", None)
+        if equalizer is not None:
+            logger.info(
+                "Box type equalizer stats: %s",
+                json.dumps(equalizer.stats(), ensure_ascii=False, sort_keys=True),
+            )
     val_loader = build_dataloader(
         args.data_root,
         split="val",

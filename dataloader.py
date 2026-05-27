@@ -62,6 +62,287 @@ def letterbox_resize(image: Image.Image, target_size: int, target: dict) -> Tupl
     return canvas, target
 
 
+AREA_BUCKETS = (
+    ("tiny_<1%", 0.0, 0.01),
+    ("small_1-5%", 0.01, 0.05),
+    ("medium_5-20%", 0.05, 0.20),
+    ("large_>=20%", 0.20, 1.01),
+)
+
+
+def area_bucket(area_ratio: float) -> str:
+    for name, lower, upper in AREA_BUCKETS:
+        if lower <= area_ratio < upper:
+            return name
+    return AREA_BUCKETS[-1][0]
+
+
+def bucket_bounds(bucket_name: str) -> Tuple[float, float]:
+    for name, lower, upper in AREA_BUCKETS:
+        if name == bucket_name:
+            return lower, upper
+    raise KeyError(f"Unknown area bucket: {bucket_name}")
+
+
+class BoxTypeEqualizer:
+    """
+    Scale whole letterboxed images to synthesize under-represented box-size buckets
+    within each class. Down-scaling creates more small/tiny boxes; up-scaling creates
+    more medium/large boxes while cropping around the selected object.
+    """
+
+    def __init__(
+        self,
+        classes: List[str],
+        images: List[Dict],
+        ann_by_image_id: Dict[str, List[Dict]],
+        img_size: int,
+        p: float = 0.5,
+        max_downscale: float = 0.55,
+        max_upscale: float = 1.8,
+        min_visibility: float = 0.25,
+        min_box_size: float = 2.0,
+    ):
+        self.classes = classes
+        self.img_size = img_size
+        self.p = p
+        self.max_downscale = max_downscale
+        self.max_upscale = max_upscale
+        self.min_visibility = min_visibility
+        self.min_box_size = min_box_size
+        self.bucket_names = [bucket[0] for bucket in AREA_BUCKETS]
+        self.class_bucket_counts, self.class_bucket_area_ranges = self._compute_bucket_stats(images, ann_by_image_id)
+        self.class_bucket_deficits = self._compute_bucket_deficits()
+        self.class_bucket_ratios = self._compute_bucket_ratios()
+        self.class_imbalance_ratios = self._compute_imbalance_ratios()
+
+    def _compute_bucket_stats(
+        self,
+        images: List[Dict],
+        ann_by_image_id: Dict[str, List[Dict]],
+    ) -> Tuple[Dict[int, Dict[str, int]], Dict[int, Dict[str, Tuple[float, float]]]]:
+        image_by_id = {image["id"]: image for image in images}
+        counts = {
+            class_idx: {bucket: 0 for bucket in self.bucket_names}
+            for class_idx in range(len(self.classes))
+        }
+        areas = {
+            class_idx: {bucket: [] for bucket in self.bucket_names}
+            for class_idx in range(len(self.classes))
+        }
+        global_areas = {bucket: [] for bucket in self.bucket_names}
+        class_to_idx = {class_name: idx for idx, class_name in enumerate(self.classes)}
+
+        for image_id, anns in ann_by_image_id.items():
+            image_info = image_by_id.get(image_id)
+            if image_info is None:
+                continue
+            image_width = float(image_info["width"])
+            image_height = float(image_info["height"])
+            scale = self.img_size / max(image_width, image_height, 1.0)
+            canvas_area = float(self.img_size * self.img_size)
+            for ann in anns:
+                class_idx = class_to_idx.get(ann["class"])
+                if class_idx is None:
+                    continue
+                x1, y1, x2, y2 = ann["bbox"]
+                box_area = max(float(x2 - x1), 0.0) * max(float(y2 - y1), 0.0) * scale * scale
+                area_ratio = box_area / canvas_area
+                bucket = area_bucket(area_ratio)
+                counts[class_idx][bucket] += 1
+                areas[class_idx][bucket].append(area_ratio)
+                global_areas[bucket].append(area_ratio)
+
+        area_ranges = {}
+        for class_idx in range(len(self.classes)):
+            area_ranges[class_idx] = {}
+            for bucket in self.bucket_names:
+                values = areas[class_idx][bucket] or global_areas[bucket]
+                area_ranges[class_idx][bucket] = self._area_range_from_values(bucket, values)
+
+        return counts, area_ranges
+
+    def _area_range_from_values(self, bucket: str, values: List[float]) -> Tuple[float, float]:
+        lower, upper = bucket_bounds(bucket)
+        if values:
+            low, high = np.percentile(np.asarray(values, dtype=float), [20, 80])
+            low = max(float(low), lower + 1e-6)
+            high = min(float(high), upper - 1e-6)
+            if low < high:
+                return low, high
+
+        if lower <= 0:
+            lower = min(upper * 0.10, 1e-4)
+        low = lower + (upper - lower) * 0.25
+        high = lower + (upper - lower) * 0.85
+        return low, high
+
+    def _compute_bucket_deficits(self) -> Dict[int, Dict[str, int]]:
+        deficits = {}
+        for class_idx, counts in self.class_bucket_counts.items():
+            target_count = max(counts.values()) if counts else 0
+            deficits[class_idx] = {
+                bucket: max(target_count - count, 0)
+                for bucket, count in counts.items()
+            }
+        return deficits
+
+    def _compute_bucket_ratios(self) -> Dict[int, Dict[str, float]]:
+        ratios = {}
+        for class_idx, counts in self.class_bucket_counts.items():
+            total = max(sum(counts.values()), 1)
+            ratios[class_idx] = {
+                bucket: count / total
+                for bucket, count in counts.items()
+            }
+        return ratios
+
+    def _compute_imbalance_ratios(self) -> Dict[int, float]:
+        imbalance = {}
+        for class_idx, counts in self.class_bucket_counts.items():
+            non_zero_counts = [count for count in counts.values() if count > 0]
+            if not non_zero_counts:
+                imbalance[class_idx] = 0.0
+            else:
+                imbalance[class_idx] = max(non_zero_counts) / max(min(non_zero_counts), 1)
+        return imbalance
+
+    def stats(self) -> Dict[str, Dict]:
+        return {
+            self.classes[class_idx]: {
+                "counts": self.class_bucket_counts[class_idx],
+                "ratios": {
+                    bucket: round(ratio, 6)
+                    for bucket, ratio in self.class_bucket_ratios[class_idx].items()
+                },
+                "deficits": self.class_bucket_deficits[class_idx],
+                "imbalance_ratio": round(self.class_imbalance_ratios[class_idx], 6),
+                "target_area_ranges": {
+                    bucket: [round(bounds[0], 6), round(bounds[1], 6)]
+                    for bucket, bounds in self.class_bucket_area_ranges[class_idx].items()
+                },
+            }
+            for class_idx in range(len(self.classes))
+        }
+
+    def __call__(self, image: Image.Image, target: dict) -> Tuple[Image.Image, dict]:
+        if random.random() > self.p or target["boxes"].numel() == 0:
+            return image, target
+
+        candidate = self._sample_candidate(target["boxes"], target["labels"])
+        if candidate is None:
+            return image, target
+
+        box_idx, scale = candidate
+        return self._scale_image_and_boxes(image, target, box_idx, scale)
+
+    def _sample_candidate(self, boxes: torch.Tensor, labels: torch.Tensor) -> Optional[Tuple[int, float]]:
+        image_area = float(self.img_size * self.img_size)
+        candidates = []
+        weights = []
+
+        for box_idx, (box, label) in enumerate(zip(boxes, labels)):
+            class_idx = int(label)
+            current_area = max(float((box[2] - box[0]) * (box[3] - box[1])), 1.0) / image_area
+            current_bucket = area_bucket(current_area)
+            deficits = self.class_bucket_deficits.get(class_idx, {})
+
+            for target_bucket, deficit in deficits.items():
+                if deficit <= 0 or target_bucket == current_bucket:
+                    continue
+                scale_range = self._scale_range_for_bucket(class_idx, current_area, target_bucket)
+                if scale_range is None:
+                    continue
+                candidates.append((box_idx, scale_range))
+                weights.append(float(deficit))
+
+        if not candidates:
+            return None
+
+        selected_idx = random.choices(range(len(candidates)), weights=weights, k=1)[0]
+        box_idx, scale_range = candidates[selected_idx]
+        return box_idx, random.uniform(scale_range[0], scale_range[1])
+
+    def _scale_range_for_bucket(
+        self,
+        class_idx: int,
+        current_area: float,
+        target_bucket: str,
+    ) -> Optional[Tuple[float, float]]:
+        target_low, target_high = self.class_bucket_area_ranges[class_idx][target_bucket]
+        low = (target_low / max(current_area, 1e-8)) ** 0.5
+        high = (target_high / max(current_area, 1e-8)) ** 0.5
+
+        if high < 1.0:
+            low = max(low, self.max_downscale)
+            high = min(high, 0.95)
+        elif low > 1.0:
+            low = max(low, 1.05)
+            high = min(high, self.max_upscale)
+        else:
+            return None
+
+        if low > high:
+            return None
+        return low, high
+
+    def _scale_image_and_boxes(
+        self,
+        image: Image.Image,
+        target: dict,
+        selected_box_idx: int,
+        scale: float,
+    ) -> Tuple[Image.Image, dict]:
+        size = self.img_size
+        new_size = max(int(round(size * scale)), 1)
+        resized = image.resize((new_size, new_size), Image.BILINEAR)
+        boxes = target["boxes"].clone().float() * scale
+
+        if scale < 1.0:
+            offset_x = (size - new_size) // 2
+            offset_y = (size - new_size) // 2
+            canvas = Image.new("RGB", (size, size), (114, 114, 114))
+            canvas.paste(resized, (offset_x, offset_y))
+            boxes[:, [0, 2]] += offset_x
+            boxes[:, [1, 3]] += offset_y
+            image_out = canvas
+        else:
+            selected = boxes[selected_box_idx]
+            center_x = float((selected[0] + selected[2]) * 0.5)
+            center_y = float((selected[1] + selected[3]) * 0.5)
+            jitter = size * 0.10
+            crop_left = center_x - size * 0.5 + random.uniform(-jitter, jitter)
+            crop_top = center_y - size * 0.5 + random.uniform(-jitter, jitter)
+            max_crop = max(new_size - size, 0)
+            crop_left = int(round(min(max(crop_left, 0.0), float(max_crop))))
+            crop_top = int(round(min(max(crop_top, 0.0), float(max_crop))))
+            image_out = resized.crop((crop_left, crop_top, crop_left + size, crop_top + size))
+            boxes[:, [0, 2]] -= crop_left
+            boxes[:, [1, 3]] -= crop_top
+
+        original_boxes = boxes.clone()
+        boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, size)
+        boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, size)
+        widths = boxes[:, 2] - boxes[:, 0]
+        heights = boxes[:, 3] - boxes[:, 1]
+        clipped_area = widths.clamp(min=0) * heights.clamp(min=0)
+        original_area = (
+            (original_boxes[:, 2] - original_boxes[:, 0]).clamp(min=1e-6)
+            * (original_boxes[:, 3] - original_boxes[:, 1]).clamp(min=1e-6)
+        )
+        keep = (
+            (widths >= self.min_box_size)
+            & (heights >= self.min_box_size)
+            & ((clipped_area / original_area) >= self.min_visibility)
+        )
+
+        target = dict(target)
+        target["boxes"] = boxes[keep]
+        target["labels"] = target["labels"][keep]
+        target["box_type_equalizer"] = {"scale": scale}
+        return image_out, target
+
+
 
 # Dataset
 
@@ -74,12 +355,15 @@ class CustomDataset(Dataset):
         transforms: Optional[Callable] = None,
         normalize: bool = True,
         img_size: int = 512,         # target size cho letterbox
+        box_type_equalizer: bool = False,
+        box_type_equalizer_p: float = 0.5,
     ):
         self.data_root = Path(data_root)
         self.split = split
         self.transforms = transforms
         self.normalize = normalize
         self.img_size = img_size
+        self.box_type_equalizer = None
 
         annotation_path = self.data_root / "annotations" / f"{self.split}.json"
         if not annotation_path.exists():
@@ -96,6 +380,15 @@ class CustomDataset(Dataset):
         for ann in data["annotations"]:
             img_id = ann["image_id"]
             self.ann_by_image_id.setdefault(img_id, []).append(ann)
+
+        if box_type_equalizer and split == "train":
+            self.box_type_equalizer = BoxTypeEqualizer(
+                classes=self.classes,
+                images=self.images,
+                ann_by_image_id=self.ann_by_image_id,
+                img_size=self.img_size,
+                p=box_type_equalizer_p,
+            )
 
         self._normalize = trans.Normalize(mean=[0.485, 0.456, 0.406],
                                           std=[0.229, 0.224, 0.225])
@@ -130,6 +423,9 @@ class CustomDataset(Dataset):
 
         # Letterbox resize (scale + pad) — trước augmentation
         img, target = letterbox_resize(img, self.img_size, target)
+
+        if self.box_type_equalizer is not None:
+            img, target = self.box_type_equalizer(img, target)
 
         # Augmentation (albumentations hoặc custom)
         if self.transforms is not None:
@@ -173,6 +469,8 @@ def build_dataloader(
     drop_last: bool = False,
     img_size: int = 512,
     seed: Optional[int] = None,
+    box_type_equalizer: bool = False,
+    box_type_equalizer_p: float = 0.5,
 ) -> DataLoader:
 
     dataset = CustomDataset(
@@ -181,6 +479,8 @@ def build_dataloader(
         transforms=transforms,
         normalize=normalize,
         img_size=img_size,
+        box_type_equalizer=box_type_equalizer,
+        box_type_equalizer_p=box_type_equalizer_p,
     )
 
     generator = None
@@ -264,6 +564,7 @@ def build_visualized_loader(
     num_workers: int = 4,
     transforms=None,
     img_size: int = 512,
+    box_type_equalizer: bool = False,
 ) -> DataLoader:
     return build_dataloader(
         data_root=data_root,
@@ -275,4 +576,5 @@ def build_visualized_loader(
         pin_memory=False,
         drop_last=False,
         img_size=img_size,
+        box_type_equalizer=box_type_equalizer,
     )
