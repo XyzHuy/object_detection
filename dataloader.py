@@ -84,6 +84,29 @@ def bucket_bounds(bucket_name: str) -> Tuple[float, float]:
     raise KeyError(f"Unknown area bucket: {bucket_name}")
 
 
+SHAPE_BUCKETS = (
+    ("tall_<0.5", 0.0, 0.5),
+    ("portrait_0.5-0.8", 0.5, 0.8),
+    ("square_0.8-1.25", 0.8, 1.25),
+    ("landscape_1.25-2", 1.25, 2.0),
+    ("wide_>2", 2.0, float("inf")),
+)
+
+
+def shape_bucket(aspect_ratio: float) -> str:
+    for name, lower, upper in SHAPE_BUCKETS:
+        if lower <= aspect_ratio < upper:
+            return name
+    return SHAPE_BUCKETS[-1][0]
+
+
+def shape_bucket_bounds(bucket_name: str) -> Tuple[float, float]:
+    for name, lower, upper in SHAPE_BUCKETS:
+        if name == bucket_name:
+            return lower, upper
+    raise KeyError(f"Unknown shape bucket: {bucket_name}")
+
+
 class BoxTypeEqualizer:
     """
     Scale whole letterboxed images to synthesize under-represented box-size buckets
@@ -343,6 +366,268 @@ class BoxTypeEqualizer:
         return image_out, target
 
 
+class BoxShapeEqualizer:
+    """
+    Apply anisotropic whole-image scaling to synthesize under-represented
+    bbox aspect-ratio buckets within each class. This is independent from
+    BoxTypeEqualizer and uses its own train annotation statistics.
+    """
+
+    def __init__(
+        self,
+        classes: List[str],
+        ann_by_image_id: Dict[str, List[Dict]],
+        img_size: int,
+        p: float = 0.5,
+        max_axis_scale: float = 1.6,
+        min_axis_scale: float = 0.65,
+        min_visibility: float = 0.25,
+        min_box_size: float = 2.0,
+    ):
+        self.classes = classes
+        self.img_size = img_size
+        self.p = p
+        self.max_axis_scale = max_axis_scale
+        self.min_axis_scale = min_axis_scale
+        self.min_visibility = min_visibility
+        self.min_box_size = min_box_size
+        self.bucket_names = [bucket[0] for bucket in SHAPE_BUCKETS]
+        self.class_bucket_counts, self.class_bucket_aspect_ranges = self._compute_bucket_stats(ann_by_image_id)
+        self.class_bucket_deficits = self._compute_bucket_deficits()
+        self.class_bucket_ratios = self._compute_bucket_ratios()
+        self.class_imbalance_ratios = self._compute_imbalance_ratios()
+
+    def _compute_bucket_stats(
+        self,
+        ann_by_image_id: Dict[str, List[Dict]],
+    ) -> Tuple[Dict[int, Dict[str, int]], Dict[int, Dict[str, Tuple[float, float]]]]:
+        counts = {
+            class_idx: {bucket: 0 for bucket in self.bucket_names}
+            for class_idx in range(len(self.classes))
+        }
+        aspects = {
+            class_idx: {bucket: [] for bucket in self.bucket_names}
+            for class_idx in range(len(self.classes))
+        }
+        global_aspects = {bucket: [] for bucket in self.bucket_names}
+        class_to_idx = {class_name: idx for idx, class_name in enumerate(self.classes)}
+
+        for anns in ann_by_image_id.values():
+            for ann in anns:
+                class_idx = class_to_idx.get(ann["class"])
+                if class_idx is None:
+                    continue
+                x1, y1, x2, y2 = ann["bbox"]
+                width = max(float(x2 - x1), 0.0)
+                height = max(float(y2 - y1), 0.0)
+                if width <= 0 or height <= 0:
+                    continue
+                aspect = width / height
+                bucket = shape_bucket(aspect)
+                counts[class_idx][bucket] += 1
+                aspects[class_idx][bucket].append(aspect)
+                global_aspects[bucket].append(aspect)
+
+        aspect_ranges = {}
+        for class_idx in range(len(self.classes)):
+            aspect_ranges[class_idx] = {}
+            for bucket in self.bucket_names:
+                values = aspects[class_idx][bucket] or global_aspects[bucket]
+                aspect_ranges[class_idx][bucket] = self._aspect_range_from_values(bucket, values)
+
+        return counts, aspect_ranges
+
+    def _aspect_range_from_values(self, bucket: str, values: List[float]) -> Tuple[float, float]:
+        lower, upper = shape_bucket_bounds(bucket)
+        if values:
+            low, high = np.percentile(np.asarray(values, dtype=float), [20, 80])
+            low = max(float(low), lower + 1e-6)
+            high = float(high) if np.isinf(upper) else min(float(high), upper - 1e-6)
+            if low < high:
+                return low, high
+
+        if np.isinf(upper):
+            return lower * 1.10, lower * 2.00
+        if lower <= 0:
+            lower = min(upper * 0.10, 0.05)
+        low = lower + (upper - lower) * 0.25
+        high = lower + (upper - lower) * 0.85
+        return low, high
+
+    def _compute_bucket_deficits(self) -> Dict[int, Dict[str, int]]:
+        deficits = {}
+        for class_idx, counts in self.class_bucket_counts.items():
+            target_count = max(counts.values()) if counts else 0
+            deficits[class_idx] = {
+                bucket: max(target_count - count, 0)
+                for bucket, count in counts.items()
+            }
+        return deficits
+
+    def _compute_bucket_ratios(self) -> Dict[int, Dict[str, float]]:
+        ratios = {}
+        for class_idx, counts in self.class_bucket_counts.items():
+            total = max(sum(counts.values()), 1)
+            ratios[class_idx] = {
+                bucket: count / total
+                for bucket, count in counts.items()
+            }
+        return ratios
+
+    def _compute_imbalance_ratios(self) -> Dict[int, float]:
+        imbalance = {}
+        for class_idx, counts in self.class_bucket_counts.items():
+            non_zero_counts = [count for count in counts.values() if count > 0]
+            if not non_zero_counts:
+                imbalance[class_idx] = 0.0
+            else:
+                imbalance[class_idx] = max(non_zero_counts) / max(min(non_zero_counts), 1)
+        return imbalance
+
+    def stats(self) -> Dict[str, Dict]:
+        return {
+            self.classes[class_idx]: {
+                "counts": self.class_bucket_counts[class_idx],
+                "ratios": {
+                    bucket: round(ratio, 6)
+                    for bucket, ratio in self.class_bucket_ratios[class_idx].items()
+                },
+                "deficits": self.class_bucket_deficits[class_idx],
+                "imbalance_ratio": round(self.class_imbalance_ratios[class_idx], 6),
+                "target_aspect_ranges": {
+                    bucket: [round(bounds[0], 6), round(bounds[1], 6)]
+                    for bucket, bounds in self.class_bucket_aspect_ranges[class_idx].items()
+                },
+            }
+            for class_idx in range(len(self.classes))
+        }
+
+    def __call__(self, image: Image.Image, target: dict) -> Tuple[Image.Image, dict]:
+        if random.random() > self.p or target["boxes"].numel() == 0:
+            return image, target
+
+        candidate = self._sample_candidate(target["boxes"], target["labels"])
+        if candidate is None:
+            return image, target
+
+        box_idx, scale_x, scale_y = candidate
+        return self._anisotropic_scale_image_and_boxes(image, target, box_idx, scale_x, scale_y)
+
+    def _sample_candidate(self, boxes: torch.Tensor, labels: torch.Tensor) -> Optional[Tuple[int, float, float]]:
+        candidates = []
+        weights = []
+
+        for box_idx, (box, label) in enumerate(zip(boxes, labels)):
+            width = max(float(box[2] - box[0]), 1e-6)
+            height = max(float(box[3] - box[1]), 1e-6)
+            current_aspect = width / height
+            current_bucket = shape_bucket(current_aspect)
+            class_idx = int(label)
+            deficits = self.class_bucket_deficits.get(class_idx, {})
+
+            for target_bucket, deficit in deficits.items():
+                if deficit <= 0 or target_bucket == current_bucket:
+                    continue
+                scale_pair = self._axis_scales_for_bucket(class_idx, current_aspect, target_bucket)
+                if scale_pair is None:
+                    continue
+                candidates.append((box_idx, scale_pair[0], scale_pair[1]))
+                weights.append(float(deficit))
+
+        if not candidates:
+            return None
+
+        selected_idx = random.choices(range(len(candidates)), weights=weights, k=1)[0]
+        return candidates[selected_idx]
+
+    def _axis_scales_for_bucket(
+        self,
+        class_idx: int,
+        current_aspect: float,
+        target_bucket: str,
+    ) -> Optional[Tuple[float, float]]:
+        target_low, target_high = self.class_bucket_aspect_ranges[class_idx][target_bucket]
+        target_aspect = random.uniform(target_low, target_high)
+        ratio = target_aspect / max(current_aspect, 1e-8)
+        if 0.98 <= ratio <= 1.02:
+            return None
+
+        scale_x = ratio ** 0.5
+        scale_y = 1.0 / max(scale_x, 1e-8)
+        scale_x = min(max(scale_x, self.min_axis_scale), self.max_axis_scale)
+        scale_y = min(max(scale_y, self.min_axis_scale), self.max_axis_scale)
+
+        achieved_ratio = scale_x / max(scale_y, 1e-8)
+        achieved_aspect = current_aspect * achieved_ratio
+        if shape_bucket(achieved_aspect) != target_bucket:
+            return None
+        return scale_x, scale_y
+
+    def _axis_crop_or_pad(self, new_size: int, selected_center: float, target_size: int) -> Tuple[int, int]:
+        if new_size <= target_size:
+            return 0, (target_size - new_size) // 2
+
+        jitter = target_size * 0.10
+        max_crop = new_size - target_size
+        crop = selected_center - target_size * 0.5 + random.uniform(-jitter, jitter)
+        crop = int(round(min(max(crop, 0.0), float(max_crop))))
+        return crop, 0
+
+    def _anisotropic_scale_image_and_boxes(
+        self,
+        image: Image.Image,
+        target: dict,
+        selected_box_idx: int,
+        scale_x: float,
+        scale_y: float,
+    ) -> Tuple[Image.Image, dict]:
+        size = self.img_size
+        new_w = max(int(round(size * scale_x)), 1)
+        new_h = max(int(round(size * scale_y)), 1)
+        resized = image.resize((new_w, new_h), Image.BILINEAR)
+
+        boxes = target["boxes"].clone().float()
+        boxes[:, [0, 2]] *= scale_x
+        boxes[:, [1, 3]] *= scale_y
+
+        selected = boxes[selected_box_idx]
+        selected_center_x = float((selected[0] + selected[2]) * 0.5)
+        selected_center_y = float((selected[1] + selected[3]) * 0.5)
+        crop_left, pad_left = self._axis_crop_or_pad(new_w, selected_center_x, size)
+        crop_top, pad_top = self._axis_crop_or_pad(new_h, selected_center_y, size)
+
+        crop_right = crop_left + min(new_w, size)
+        crop_bottom = crop_top + min(new_h, size)
+        cropped = resized.crop((crop_left, crop_top, crop_right, crop_bottom))
+        image_out = Image.new("RGB", (size, size), (114, 114, 114))
+        image_out.paste(cropped, (pad_left, pad_top))
+
+        boxes[:, [0, 2]] = boxes[:, [0, 2]] - crop_left + pad_left
+        boxes[:, [1, 3]] = boxes[:, [1, 3]] - crop_top + pad_top
+
+        original_boxes = boxes.clone()
+        boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, size)
+        boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, size)
+        widths = boxes[:, 2] - boxes[:, 0]
+        heights = boxes[:, 3] - boxes[:, 1]
+        clipped_area = widths.clamp(min=0) * heights.clamp(min=0)
+        original_area = (
+            (original_boxes[:, 2] - original_boxes[:, 0]).clamp(min=1e-6)
+            * (original_boxes[:, 3] - original_boxes[:, 1]).clamp(min=1e-6)
+        )
+        keep = (
+            (widths >= self.min_box_size)
+            & (heights >= self.min_box_size)
+            & ((clipped_area / original_area) >= self.min_visibility)
+        )
+
+        target = dict(target)
+        target["boxes"] = boxes[keep]
+        target["labels"] = target["labels"][keep]
+        target["box_shape_equalizer"] = {"scale_x": scale_x, "scale_y": scale_y}
+        return image_out, target
+
+
 
 # Dataset
 
@@ -357,6 +642,8 @@ class CustomDataset(Dataset):
         img_size: int = 512,         # target size cho letterbox
         box_type_equalizer: bool = False,
         box_type_equalizer_p: float = 0.5,
+        box_shape_equalizer: bool = False,
+        box_shape_equalizer_p: float = 0.5,
     ):
         self.data_root = Path(data_root)
         self.split = split
@@ -364,6 +651,7 @@ class CustomDataset(Dataset):
         self.normalize = normalize
         self.img_size = img_size
         self.box_type_equalizer = None
+        self.box_shape_equalizer = None
 
         annotation_path = self.data_root / "annotations" / f"{self.split}.json"
         if not annotation_path.exists():
@@ -388,6 +676,13 @@ class CustomDataset(Dataset):
                 ann_by_image_id=self.ann_by_image_id,
                 img_size=self.img_size,
                 p=box_type_equalizer_p,
+            )
+        if box_shape_equalizer and split == "train":
+            self.box_shape_equalizer = BoxShapeEqualizer(
+                classes=self.classes,
+                ann_by_image_id=self.ann_by_image_id,
+                img_size=self.img_size,
+                p=box_shape_equalizer_p,
             )
 
         self._normalize = trans.Normalize(mean=[0.485, 0.456, 0.406],
@@ -426,6 +721,8 @@ class CustomDataset(Dataset):
 
         if self.box_type_equalizer is not None:
             img, target = self.box_type_equalizer(img, target)
+        if self.box_shape_equalizer is not None:
+            img, target = self.box_shape_equalizer(img, target)
 
         # Augmentation (albumentations hoặc custom)
         if self.transforms is not None:
@@ -471,6 +768,8 @@ def build_dataloader(
     seed: Optional[int] = None,
     box_type_equalizer: bool = False,
     box_type_equalizer_p: float = 0.5,
+    box_shape_equalizer: bool = False,
+    box_shape_equalizer_p: float = 0.5,
 ) -> DataLoader:
 
     dataset = CustomDataset(
@@ -481,6 +780,8 @@ def build_dataloader(
         img_size=img_size,
         box_type_equalizer=box_type_equalizer,
         box_type_equalizer_p=box_type_equalizer_p,
+        box_shape_equalizer=box_shape_equalizer,
+        box_shape_equalizer_p=box_shape_equalizer_p,
     )
 
     generator = None
@@ -565,6 +866,7 @@ def build_visualized_loader(
     transforms=None,
     img_size: int = 512,
     box_type_equalizer: bool = False,
+    box_shape_equalizer: bool = False,
 ) -> DataLoader:
     return build_dataloader(
         data_root=data_root,
@@ -577,4 +879,5 @@ def build_visualized_loader(
         drop_last=False,
         img_size=img_size,
         box_type_equalizer=box_type_equalizer,
+        box_shape_equalizer=box_shape_equalizer,
     )

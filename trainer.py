@@ -300,6 +300,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Scale train images to synthesize under-represented box-size buckets per class before Albumentations.",
     )
+    parser.add_argument(
+        "--box_shape_equalizer",
+        action="store_true",
+        help="Anisotropically scale train images to synthesize under-represented box-shape buckets per class before Albumentations.",
+    )
     parser.add_argument("--scratch_backbone", action="store_true")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Set to -1 to disable fixed seeding.")
     parser.add_argument("--deterministic", action="store_true", help="Use deterministic PyTorch kernels when available.")
@@ -335,12 +340,20 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         img_size=args.img_size,
         seed=run_seed,
         box_type_equalizer=args.box_type_equalizer,
+        box_shape_equalizer=args.box_shape_equalizer,
     )
     if args.box_type_equalizer:
         equalizer = getattr(train_loader.dataset, "box_type_equalizer", None)
         if equalizer is not None:
             logger.info(
                 "Box type equalizer stats: %s",
+                json.dumps(equalizer.stats(), ensure_ascii=False, sort_keys=True),
+            )
+    if args.box_shape_equalizer:
+        equalizer = getattr(train_loader.dataset, "box_shape_equalizer", None)
+        if equalizer is not None:
+            logger.info(
+                "Box shape equalizer stats: %s",
                 json.dumps(equalizer.stats(), ensure_ascii=False, sort_keys=True),
             )
     val_loader = build_dataloader(
