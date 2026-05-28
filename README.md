@@ -21,5 +21,3 @@ python predict.py \
   --output predictions.json
 ```
 
-By default prediction loads `./models/best.pth` and applies tuned per-class
-thresholds from `./models/best_thresholds.json` when that file exists.

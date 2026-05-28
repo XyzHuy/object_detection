@@ -278,7 +278,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone_lr", type=float, default=DEFAULT_BACKBONE_LR)
     parser.add_argument("--weight_decay", type=float, default=DEFAULT_WEIGHT_DECAY)
     parser.add_argument("--output_dir", default="models")
-    parser.add_argument("--log_dir", default="logs")
+    parser.add_argument("--log_dir", default="utils/logs")
     parser.add_argument("--conf_threshold", type=float, default=DEFAULT_CONF_THRESHOLD)
     parser.add_argument("--nms_iou", type=float, default=DEFAULT_NMS_IOU)
     parser.add_argument("--max_det", type=int, default=DEFAULT_MAX_DET)
