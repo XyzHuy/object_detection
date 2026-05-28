@@ -10,10 +10,10 @@ from pathlib import Path
 
 import torch
 
-from dataloader import build_dataloader
-from inference import collect_images, load_annotation_index, load_model, predict_image
-from loss import YOLOv8Loss
-from trainer import evaluate_model, load_classes, run_dir
+from utils.dataloader import build_dataloader
+from utils.inference import collect_images, load_annotation_index, load_model, predict_image
+from utils.loss import YOLOv8Loss
+from utils.trainer import evaluate_model, load_classes, run_dir
 
 
 def setup_eval_logger(log_dir: str | Path, checkpoint: str | Path) -> tuple[logging.Logger, Path]:
@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
         default="best",
         help="Checkpoint filename stem to evaluate when --checkpoint is not set, e.g. best or alter_best.",
     )
-    parser.add_argument("--checkpoint_root", default="checkpoints")
+    parser.add_argument("--checkpoint_root", default="models")
     parser.add_argument("--data_root", default="final_public/public")
     parser.add_argument("--split", default="val")
     parser.add_argument("--img_size", type=int, default=512)
@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictions_output")
     parser.add_argument("--metrics_output")
     parser.add_argument("--official_score_output")
-    parser.add_argument("--official_evaluator", default="final_public/public/tools/evaluate_predictions.py")
+    parser.add_argument("--official_evaluator", default="utils/official_evaluator/evaluate_predictions.py")
     parser.add_argument("--official_ground_truth")
     return parser.parse_args()
 

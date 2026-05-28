@@ -1,4 +1,4 @@
-from trainer import main
+from utils.trainer import main
 
 
 if __name__ == "__main__":

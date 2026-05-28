@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from tqdm import tqdm
 
-from inference import collect_images, load_annotation_index, load_model, predict_image
+from utils.inference import collect_images, load_annotation_index, load_model, predict_image
 
 
 DEFAULT_THRESHOLDS = (
@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
             "keeping mAP above --min_map50."
         ),
     )
-    parser.add_argument("--official_evaluator", default="final_public/public/tools/evaluate_predictions.py")
+    parser.add_argument("--official_evaluator", default="utils/official_evaluator/evaluate_predictions.py")
     parser.add_argument("--ground_truth")
     parser.add_argument("--output_dir", default="threshold_sweeps")
     parser.add_argument(

@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.head import dist2bbox, make_anchors
+from utils.model.head import dist2bbox, make_anchors
 
 
 def box_iou(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:

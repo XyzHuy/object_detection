@@ -14,10 +14,10 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
-from dataloader import albumentations_transform, build_dataloader
-from loss import YOLOv8Loss
-from metrics import detection_metrics, filter_predictions_by_score, non_max_suppression
-from model import YOLOv8Scratch
+from utils.dataloader import albumentations_transform, build_dataloader
+from utils.loss import YOLOv8Loss
+from utils.metrics import detection_metrics, filter_predictions_by_score, non_max_suppression
+from utils.model import YOLOv8Scratch
 
 
 DEFAULT_IMG_SIZE = 512
@@ -265,6 +265,11 @@ def save_checkpoint(path: Path, model, epoch: int, classes: list[str], metrics: 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Train YOLOv8 with ImageNet-pretrained CSPDarkNet backbone")
     parser.add_argument("--data_root", default="final_public/public")
+    parser.add_argument("--train_data", help="Submission CLI alias for ./public/annotations/train.json")
+    parser.add_argument("--val_data", help="Submission CLI alias for ./public/annotations/val.json")
+    parser.add_argument("--image_dir", help="Submission CLI compatibility argument; images are resolved through data_root.")
+    parser.add_argument("--val_image_dir", help="Submission CLI compatibility argument; images are resolved through data_root.")
+    parser.add_argument("--checkpoint_dir", help="Submission CLI alias for --output_dir; saves best.pth directly here.")
     parser.add_argument("--img_size", type=int, default=DEFAULT_IMG_SIZE)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
@@ -272,7 +277,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--backbone_lr", type=float, default=DEFAULT_BACKBONE_LR)
     parser.add_argument("--weight_decay", type=float, default=DEFAULT_WEIGHT_DECAY)
-    parser.add_argument("--output_dir", default="checkpoints")
+    parser.add_argument("--output_dir", default="models")
     parser.add_argument("--log_dir", default="logs")
     parser.add_argument("--conf_threshold", type=float, default=DEFAULT_CONF_THRESHOLD)
     parser.add_argument("--nms_iou", type=float, default=DEFAULT_NMS_IOU)
@@ -297,18 +302,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_aug", action="store_true")
     parser.add_argument(
         "--box_type_equalizer",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Scale train images to synthesize under-represented box-size buckets per class before Albumentations.",
     )
     parser.add_argument(
         "--box_shape_equalizer",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Anisotropically scale train images to synthesize under-represented box-shape buckets per class before Albumentations.",
     )
     parser.add_argument("--scratch_backbone", action="store_true")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Set to -1 to disable fixed seeding.")
     parser.add_argument("--deterministic", action="store_true", help="Use deterministic PyTorch kernels when available.")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    args.flat_checkpoint_dir = False
+    if args.train_data:
+        train_data = Path(args.train_data)
+        if train_data.name != "train.json":
+            raise ValueError("--train_data should point to annotations/train.json")
+        args.data_root = str(train_data.parent.parent)
+    if args.checkpoint_dir:
+        args.output_dir = args.checkpoint_dir
+        args.flat_checkpoint_dir = True
+    return args
 
 
 def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, log_dir: Path) -> None:
@@ -516,11 +534,16 @@ def main() -> None:
 
     experiment = experiment_name()
     for run_idx in range(args.num_runs):
+        output_dir = Path(args.output_dir)
+        log_dir = Path(args.log_dir)
+        if not getattr(args, "flat_checkpoint_dir", False) or args.num_runs > 1:
+            output_dir = run_dir(args.output_dir, experiment, run_idx)
+            log_dir = run_dir(args.log_dir, experiment, run_idx)
         train_single_run(
             args=args,
             run_idx=run_idx,
-            output_dir=run_dir(args.output_dir, experiment, run_idx),
-            log_dir=run_dir(args.log_dir, experiment, run_idx),
+            output_dir=output_dir,
+            log_dir=log_dir,
         )
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

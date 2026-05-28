@@ -9,8 +9,8 @@ import torchvision.transforms as trans
 import torchvision.transforms.functional as trans_func
 from PIL import Image
 
-from metrics import non_max_suppression
-from model import YOLOv8Scratch
+from utils.metrics import non_max_suppression
+from utils.model import YOLOv8Scratch
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
