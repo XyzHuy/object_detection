@@ -4,3 +4,5 @@
 /.codex
 /model/__pycache__
 /logs
+/utils/__pycache__
+/utils/model/__pycache__
