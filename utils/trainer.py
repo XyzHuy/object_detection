@@ -38,6 +38,7 @@ DEFAULT_MAX_DET = 100
 DEFAULT_SEED = 42
 DEFAULT_NUM_RUNS = 1
 DEFAULT_EMA_DECAY = 0.9999
+DEFAULT_MOSAIC_P = 0.3
 
 
 def experiment_name() -> str:
@@ -343,6 +344,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ema_decay", type=float, default=DEFAULT_EMA_DECAY)
     parser.add_argument("--no_aug", action="store_true")
     parser.add_argument(
+        "--mosaic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use YOLO-style 4-image mosaic augmentation during training.",
+    )
+    parser.add_argument("--mosaic_p", type=float, default=DEFAULT_MOSAIC_P)
+    parser.add_argument(
         "--box_type_equalizer",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -370,6 +378,8 @@ def parse_args() -> argparse.Namespace:
         args.flat_checkpoint_dir = True
     if not 0.0 <= args.ema_decay < 1.0:
         raise ValueError("--ema_decay must be in [0, 1)")
+    if not 0.0 <= args.mosaic_p <= 1.0:
+        raise ValueError("--mosaic_p must be in [0, 1]")
     return args
 
 
@@ -403,6 +413,8 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         seed=run_seed,
         box_type_equalizer=args.box_type_equalizer,
         box_shape_equalizer=args.box_shape_equalizer,
+        mosaic=args.mosaic and not args.no_aug,
+        mosaic_p=args.mosaic_p,
     )
     if args.box_type_equalizer:
         equalizer = getattr(train_loader.dataset, "box_type_equalizer", None)
@@ -446,6 +458,11 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         "Class weighting: enabled=%s scheme=sqrt_inverse weights=%s",
         args.class_weighting,
         json.dumps({class_name: round(float(weight), 6) for class_name, weight in zip(classes, class_weights)}),
+    )
+    logger.info(
+        "Mosaic: enabled=%s p=%.3f equalizers_apply_only_to_non_mosaic_samples=true",
+        args.mosaic and not args.no_aug,
+        args.mosaic_p,
     )
     criterion = YOLOv8Loss(
         num_classes=len(classes),

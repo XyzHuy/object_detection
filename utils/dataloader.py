@@ -628,6 +628,158 @@ class BoxShapeEqualizer:
         return image_out, target
 
 
+class MosaicAugmentation:
+    """YOLO-style 4-image mosaic on the final training canvas."""
+
+    def __init__(
+        self,
+        img_size: int,
+        p: float = 0.5,
+        min_visibility: float = 0.10,
+        min_box_size: float = 2.0,
+        fill: Tuple[int, int, int] = (114, 114, 114),
+    ):
+        self.img_size = img_size
+        self.p = p
+        self.min_visibility = min_visibility
+        self.min_box_size = min_box_size
+        self.fill = fill
+
+    def should_apply(self) -> bool:
+        return random.random() < self.p
+
+    def __call__(self, dataset: "CustomDataset", idx: int) -> Tuple[Image.Image, dict]:
+        size = self.img_size
+        base_image_id = dataset.images[idx]["id"]
+        indices = [idx] + random.choices(range(len(dataset)), k=3)
+        random.shuffle(indices)
+        center_x = int(random.uniform(size * 0.25, size * 0.75))
+        center_y = int(random.uniform(size * 0.25, size * 0.75))
+
+        mosaic = Image.new("RGB", (size, size), self.fill)
+        all_boxes = []
+        all_labels = []
+        source_ids = []
+
+        for mosaic_idx, sample_idx in enumerate(indices):
+            image, target = dataset.load_raw_sample(sample_idx)
+            source_ids.append(target["image_id"])
+            image, boxes = self._resize_image_and_boxes(image, target["boxes"])
+            labels = target["labels"]
+            paste_box = self._placement(mosaic_idx, image.size, center_x, center_y)
+            if paste_box is None:
+                continue
+
+            dst, src = paste_box
+            dst_x1, dst_y1, dst_x2, dst_y2 = dst
+            src_x1, src_y1, src_x2, src_y2 = src
+            crop = image.crop((src_x1, src_y1, src_x2, src_y2))
+            mosaic.paste(crop, (dst_x1, dst_y1))
+
+            if boxes.numel() == 0:
+                continue
+
+            boxes = boxes.clone().float()
+            boxes[:, [0, 2]] += dst_x1 - src_x1
+            boxes[:, [1, 3]] += dst_y1 - src_y1
+            original_boxes = boxes.clone()
+            boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, size)
+            boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, size)
+
+            keep = self._valid_boxes(boxes, original_boxes)
+            if keep.any():
+                all_boxes.append(boxes[keep])
+                all_labels.append(labels[keep])
+
+        if all_boxes:
+            boxes_out = torch.cat(all_boxes, dim=0)
+            labels_out = torch.cat(all_labels, dim=0).long()
+        else:
+            boxes_out = torch.zeros((0, 4), dtype=torch.float32)
+            labels_out = torch.zeros((0,), dtype=torch.int64)
+
+        return mosaic, {
+            "boxes": boxes_out,
+            "labels": labels_out,
+            "image_id": base_image_id,
+            "mosaic": {"source_image_ids": source_ids},
+        }
+
+    def _resize_image_and_boxes(
+        self,
+        image: Image.Image,
+        boxes: torch.Tensor,
+    ) -> Tuple[Image.Image, torch.Tensor]:
+        width, height = image.size
+        scale = self.img_size / max(width, height, 1)
+        new_w = max(int(round(width * scale)), 1)
+        new_h = max(int(round(height * scale)), 1)
+        image = image.resize((new_w, new_h), Image.BILINEAR)
+        boxes = boxes.clone().float()
+        if boxes.numel() > 0:
+            boxes[:, [0, 2]] *= scale
+            boxes[:, [1, 3]] *= scale
+        return image, boxes
+
+    def _placement(
+        self,
+        mosaic_idx: int,
+        image_size: Tuple[int, int],
+        center_x: int,
+        center_y: int,
+    ) -> Optional[Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]]:
+        size = self.img_size
+        width, height = image_size
+
+        if mosaic_idx == 0:
+            dst_x1 = max(center_x - width, 0)
+            dst_y1 = max(center_y - height, 0)
+            dst_x2, dst_y2 = center_x, center_y
+            src_x1 = width - (dst_x2 - dst_x1)
+            src_y1 = height - (dst_y2 - dst_y1)
+            src_x2, src_y2 = width, height
+        elif mosaic_idx == 1:
+            dst_x1 = center_x
+            dst_y1 = max(center_y - height, 0)
+            dst_x2 = min(center_x + width, size)
+            dst_y2 = center_y
+            src_x1 = 0
+            src_y1 = height - (dst_y2 - dst_y1)
+            src_x2, src_y2 = dst_x2 - dst_x1, height
+        elif mosaic_idx == 2:
+            dst_x1 = max(center_x - width, 0)
+            dst_y1 = center_y
+            dst_x2 = center_x
+            dst_y2 = min(center_y + height, size)
+            src_x1 = width - (dst_x2 - dst_x1)
+            src_y1 = 0
+            src_x2, src_y2 = width, dst_y2 - dst_y1
+        else:
+            dst_x1, dst_y1 = center_x, center_y
+            dst_x2 = min(center_x + width, size)
+            dst_y2 = min(center_y + height, size)
+            src_x1, src_y1 = 0, 0
+            src_x2, src_y2 = dst_x2 - dst_x1, dst_y2 - dst_y1
+
+        if dst_x2 <= dst_x1 or dst_y2 <= dst_y1 or src_x2 <= src_x1 or src_y2 <= src_y1:
+            return None
+        return (dst_x1, dst_y1, dst_x2, dst_y2), (src_x1, src_y1, src_x2, src_y2)
+
+    def _valid_boxes(self, boxes: torch.Tensor, original_boxes: torch.Tensor) -> torch.Tensor:
+        widths = boxes[:, 2] - boxes[:, 0]
+        heights = boxes[:, 3] - boxes[:, 1]
+        clipped_area = widths.clamp(min=0) * heights.clamp(min=0)
+        original_area = (
+            (original_boxes[:, 2] - original_boxes[:, 0]).clamp(min=1e-6)
+            * (original_boxes[:, 3] - original_boxes[:, 1]).clamp(min=1e-6)
+        )
+        return (
+            (widths >= self.min_box_size)
+            & (heights >= self.min_box_size)
+            & ((clipped_area / original_area) >= self.min_visibility)
+        )
+
+
 
 # Dataset
 
@@ -644,6 +796,8 @@ class CustomDataset(Dataset):
         box_type_equalizer_p: float = 0.5,
         box_shape_equalizer: bool = False,
         box_shape_equalizer_p: float = 0.5,
+        mosaic: bool = False,
+        mosaic_p: float = 0.5,
     ):
         self.data_root = Path(data_root)
         self.split = split
@@ -652,6 +806,11 @@ class CustomDataset(Dataset):
         self.img_size = img_size
         self.box_type_equalizer = None
         self.box_shape_equalizer = None
+        self.mosaic = (
+            MosaicAugmentation(img_size=self.img_size, p=mosaic_p)
+            if mosaic and split == "train"
+            else None
+        )
 
         annotation_path = self.data_root / "annotations" / f"{self.split}.json"
         if not annotation_path.exists():
@@ -691,7 +850,7 @@ class CustomDataset(Dataset):
     def __len__(self):
         return len(self.images)
 
-    def __getitem__(self, idx: int):
+    def load_raw_sample(self, idx: int) -> Tuple[Image.Image, dict]:
         img_info = self.images[idx]
         img_id   = img_info["id"]
 
@@ -715,14 +874,22 @@ class CustomDataset(Dataset):
             labels = torch.zeros((0,),   dtype=torch.int64)
 
         target = {"boxes": boxes, "labels": labels, "image_id": img_id}
+        return img, target
 
-        # Letterbox resize (scale + pad) — trước augmentation
-        img, target = letterbox_resize(img, self.img_size, target)
+    def __getitem__(self, idx: int):
+        use_mosaic = self.mosaic is not None and self.mosaic.should_apply()
+        if use_mosaic:
+            img, target = self.mosaic(self, idx)
+        else:
+            img, target = self.load_raw_sample(idx)
 
-        if self.box_type_equalizer is not None:
-            img, target = self.box_type_equalizer(img, target)
-        if self.box_shape_equalizer is not None:
-            img, target = self.box_shape_equalizer(img, target)
+            # Letterbox resize (scale + pad) — trước augmentation
+            img, target = letterbox_resize(img, self.img_size, target)
+
+            if self.box_type_equalizer is not None:
+                img, target = self.box_type_equalizer(img, target)
+            if self.box_shape_equalizer is not None:
+                img, target = self.box_shape_equalizer(img, target)
 
         # Augmentation (albumentations hoặc custom)
         if self.transforms is not None:
@@ -770,6 +937,8 @@ def build_dataloader(
     box_type_equalizer_p: float = 0.5,
     box_shape_equalizer: bool = False,
     box_shape_equalizer_p: float = 0.5,
+    mosaic: bool = False,
+    mosaic_p: float = 0.5,
 ) -> DataLoader:
 
     dataset = CustomDataset(
@@ -782,6 +951,8 @@ def build_dataloader(
         box_type_equalizer_p=box_type_equalizer_p,
         box_shape_equalizer=box_shape_equalizer,
         box_shape_equalizer_p=box_shape_equalizer_p,
+        mosaic=mosaic,
+        mosaic_p=mosaic_p,
     )
 
     generator = None
@@ -867,6 +1038,8 @@ def build_visualized_loader(
     img_size: int = 512,
     box_type_equalizer: bool = False,
     box_shape_equalizer: bool = False,
+    mosaic: bool = False,
+    mosaic_p: float = 0.5,
 ) -> DataLoader:
     return build_dataloader(
         data_root=data_root,
@@ -880,4 +1053,6 @@ def build_visualized_loader(
         img_size=img_size,
         box_type_equalizer=box_type_equalizer,
         box_shape_equalizer=box_shape_equalizer,
+        mosaic=mosaic,
+        mosaic_p=mosaic_p,
     )
