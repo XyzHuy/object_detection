@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
+import math
 import random
 import sys
 from datetime import datetime
@@ -35,6 +37,7 @@ DEFAULT_NMS_IOU = 0.65
 DEFAULT_MAX_DET = 100
 DEFAULT_SEED = 42
 DEFAULT_NUM_RUNS = 1
+DEFAULT_EMA_DECAY = 0.9999
 
 
 def experiment_name() -> str:
@@ -127,6 +130,32 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
         torch.use_deterministic_algorithms(True, warn_only=True)
 
 
+class ModelEMA:
+    """Exponential moving average of model weights for validation and checkpointing."""
+
+    def __init__(self, model: torch.nn.Module, decay: float = DEFAULT_EMA_DECAY) -> None:
+        self.ema = copy.deepcopy(model).eval()
+        self.decay = decay
+        self.updates = 0
+        for param in self.ema.parameters():
+            param.requires_grad_(False)
+
+    def _decay(self) -> float:
+        return self.decay * (1.0 - math.exp(-self.updates / 2000.0))
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        self.updates += 1
+        decay = self._decay()
+        model_state = model.state_dict()
+        for name, ema_value in self.ema.state_dict().items():
+            model_value = model_state[name].detach()
+            if torch.is_floating_point(ema_value):
+                ema_value.mul_(decay).add_(model_value, alpha=1.0 - decay)
+            else:
+                ema_value.copy_(model_value)
+
+
 def train_one_epoch(
     model,
     loader,
@@ -136,6 +165,7 @@ def train_one_epoch(
     scaler,
     amp: bool,
     epoch: int,
+    ema: ModelEMA | None = None,
 ) -> dict:
     model.train()
     running = {"loss": 0.0, "box": 0.0, "cls": 0.0, "dfl": 0.0}
@@ -153,8 +183,11 @@ def train_one_epoch(
         scaler.scale(loss_items.loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+        scale_before_step = scaler.get_scale()
         scaler.step(optimizer)
         scaler.update()
+        if ema is not None and (not amp or scaler.get_scale() >= scale_before_step):
+            ema.update(model)
 
         batch_size = images.shape[0]
         running["loss"] += float(loss_items.loss.detach()) * batch_size
@@ -299,6 +332,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num_runs", type=int, default=DEFAULT_NUM_RUNS)
     parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument(
+        "--EMA",
+        "--ema",
+        dest="ema",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use exponential moving average weights for validation and saved checkpoints.",
+    )
+    parser.add_argument("--ema_decay", type=float, default=DEFAULT_EMA_DECAY)
     parser.add_argument("--no_aug", action="store_true")
     parser.add_argument(
         "--box_type_equalizer",
@@ -326,6 +368,8 @@ def parse_args() -> argparse.Namespace:
     if args.checkpoint_dir:
         args.output_dir = args.checkpoint_dir
         args.flat_checkpoint_dir = True
+    if not 0.0 <= args.ema_decay < 1.0:
+        raise ValueError("--ema_decay must be in [0, 1)")
     return args
 
 
@@ -389,6 +433,7 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         pretrained_backbone=not args.scratch_backbone,
         use_cspdarknet=not args.scratch_backbone,
     ).to(device)
+    ema = ModelEMA(model, decay=args.ema_decay) if args.ema else None
     class_weights, class_counts = compute_class_weights(
         data_root=args.data_root,
         classes=classes,
@@ -433,6 +478,7 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         args.backbone_lr,
         args.weight_decay,
     )
+    logger.info("EMA: enabled=%s decay=%.6g", args.ema, args.ema_decay)
 
     for epoch in range(1, args.epochs + 1):
         if epoch == args.freeze_backbone_epochs + 1:
@@ -440,10 +486,19 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
             logger.info("Unfroze CSPDarkNet feature extractor at epoch %d", epoch)
 
         train_metrics = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, scaler, device.type == "cuda" and not args.no_amp, epoch
-        )
-        val_metrics = evaluate_model(
             model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            scaler,
+            device.type == "cuda" and not args.no_amp,
+            epoch,
+            ema=ema,
+        )
+        eval_model = ema.ema if ema is not None else model
+        val_metrics = evaluate_model(
+            eval_model,
             val_loader,
             criterion,
             device,
@@ -462,6 +517,7 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
             "run": run_idx,
             "seed": run_seed,
             "experiment": experiment_name(),
+            "ema": ema is not None,
         }
         logger.info(
             "epoch %03d/%03d | loss=%.4f box=%.4f cls=%.4f dfl=%.4f | "
@@ -489,7 +545,7 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         if args.alter_best_min_map >= 0 and metrics["mAP50"] >= args.alter_best_min_map:
             alter_best_epoch = epoch
             alter_best_map = metrics["mAP50"]
-            save_checkpoint(output_dir / "alter_best.pth", model, epoch, classes, metrics)
+            save_checkpoint(output_dir / "alter_best.pth", eval_model, epoch, classes, metrics)
             logger.info(
                 "Saved alter_best checkpoint: mAP50=%.6f at epoch %d "
                 "(latest epoch with mAP50 >= %.6f)",
@@ -501,7 +557,7 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
             best_map = metrics["mAP50"]
             best_epoch = epoch
             epochs_without_improvement = 0
-            save_checkpoint(output_dir / "best.pth", model, epoch, classes, metrics)
+            save_checkpoint(output_dir / "best.pth", eval_model, epoch, classes, metrics)
             logger.info("Saved new best checkpoint: mAP50=%.6f at epoch %d", best_map, epoch)
         else:
             epochs_without_improvement += 1
