@@ -3,6 +3,7 @@
 /.agents
 /.codex
 /model/__pycache__
-/logs
+/utis/logs
 /utils/__pycache__
 /utils/model/__pycache__
+/utils/official_evaluator/__pycache__
