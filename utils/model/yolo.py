@@ -12,23 +12,28 @@ class YOLOv8Scratch(nn.Module):
         pretrained_backbone=True,
         backbone_name="cspdarknet53",
         use_cspdarknet=True,
+        use_p2=False,
     ):
         super().__init__()
+        self.use_p2 = use_p2
+        head_channels = (64, 128, 256, 512) if use_p2 else (128, 256, 512)
+        head_strides = (4, 8, 16, 32) if use_p2 else (8, 16, 32)
 
         if use_cspdarknet:
             self.backbone = CSPDarknetBackbone(
                 model_name=backbone_name,
                 pretrained=pretrained_backbone,
+                use_p2=use_p2,
             )
         else:
-            self.backbone = YOLOv8Backbone()
-        self.neck = YOLOv8Neck()
+            self.backbone = YOLOv8Backbone(use_p2=use_p2)
+        self.neck = YOLOv8Neck(use_p2=use_p2)
 
         self.head = YOLOv8DetectHead(
             num_classes=num_classes,
-            channels=(128, 256, 512),
+            channels=head_channels,
             reg_max=16,
-            strides=(8, 16, 32),
+            strides=head_strides,
         )
 
     def forward(self, x):
@@ -37,9 +42,8 @@ class YOLOv8Scratch(nn.Module):
         return self.head(features)
 
     def forward_features(self, x):
-        p3, p4, p5 = self.backbone(x)
-        n3, n4, n5 = self.neck(p3, p4, p5)
-        return [n3, n4, n5]
+        backbone_features = self.backbone(x)
+        return list(self.neck(*backbone_features))
 
     def loss_outputs(self, x):
         features = self.forward_features(x)

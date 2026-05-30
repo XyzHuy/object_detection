@@ -279,7 +279,14 @@ def build_optimizer(model, lr: float, backbone_lr: float, weight_decay: float):
     return AdamW(param_groups, weight_decay=weight_decay)
 
 
-def save_checkpoint(path: Path, model, epoch: int, classes: list[str], metrics: dict) -> None:
+def save_checkpoint(
+    path: Path,
+    model,
+    epoch: int,
+    classes: list[str],
+    metrics: dict,
+    model_config: dict | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     compact_state = {
         key: value.detach().cpu().half() if torch.is_floating_point(value) else value.detach().cpu()
@@ -291,6 +298,7 @@ def save_checkpoint(path: Path, model, epoch: int, classes: list[str], metrics: 
             "model": compact_state,
             "classes": classes,
             "metrics": metrics,
+            "model_config": model_config or {},
         },
         path,
     )
@@ -363,6 +371,12 @@ def parse_args() -> argparse.Namespace:
         help="Anisotropically scale train images to synthesize under-represented box-shape buckets per class before Albumentations.",
     )
     parser.add_argument("--scratch_backbone", action="store_true")
+    parser.add_argument(
+        "--p2_head",
+        action="store_true",
+        default=True,
+        help="Add a stride-4 P2 detection head for small objects. Starts a new incompatible checkpoint architecture.",
+    )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Set to -1 to disable fixed seeding.")
     parser.add_argument("--deterministic", action="store_true", help="Use deterministic PyTorch kernels when available.")
     args = parser.parse_args()
@@ -444,7 +458,13 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         num_classes=len(classes),
         pretrained_backbone=not args.scratch_backbone,
         use_cspdarknet=not args.scratch_backbone,
+        use_p2=args.p2_head,
     ).to(device)
+    model_config = {
+        "use_p2": args.p2_head,
+        "use_cspdarknet": not args.scratch_backbone,
+        "backbone_name": "cspdarknet53",
+    }
     ema = ModelEMA(model, decay=args.ema_decay) if args.ema else None
     class_weights, class_counts = compute_class_weights(
         data_root=args.data_root,
@@ -496,6 +516,7 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         args.weight_decay,
     )
     logger.info("EMA: enabled=%s decay=%.6g", args.ema, args.ema_decay)
+    logger.info("Model config: %s", json.dumps(model_config, ensure_ascii=False, sort_keys=True))
 
     for epoch in range(1, args.epochs + 1):
         if epoch == args.freeze_backbone_epochs + 1:
@@ -562,7 +583,7 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         if args.alter_best_min_map >= 0 and metrics["mAP50"] >= args.alter_best_min_map:
             alter_best_epoch = epoch
             alter_best_map = metrics["mAP50"]
-            save_checkpoint(output_dir / "alter_best.pth", eval_model, epoch, classes, metrics)
+            save_checkpoint(output_dir / "alter_best.pth", eval_model, epoch, classes, metrics, model_config)
             logger.info(
                 "Saved alter_best checkpoint: mAP50=%.6f at epoch %d "
                 "(latest epoch with mAP50 >= %.6f)",
@@ -574,7 +595,7 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
             best_map = metrics["mAP50"]
             best_epoch = epoch
             epochs_without_improvement = 0
-            save_checkpoint(output_dir / "best.pth", eval_model, epoch, classes, metrics)
+            save_checkpoint(output_dir / "best.pth", eval_model, epoch, classes, metrics, model_config)
             logger.info("Saved new best checkpoint: mAP50=%.6f at epoch %d", best_map, epoch)
         else:
             epochs_without_improvement += 1

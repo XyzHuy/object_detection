@@ -5,8 +5,9 @@ from .common import Conv, C2f
 
 
 class YOLOv8Neck(nn.Module):
-    def __init__(self):
+    def __init__(self, use_p2: bool = False):
         super().__init__()
+        self.use_p2 = use_p2
 
 
         #top down
@@ -16,15 +17,29 @@ class YOLOv8Neck(nn.Module):
         self.reduce_p4 = Conv(256, 128, k = 1, s = 1)
         self.c2f_p3 = C2f(128 + 128, 128 , n = 1)
 
+        if self.use_p2:
+            self.reduce_p3 = Conv(128, 64, k=1, s=1)
+            self.c2f_p2 = C2f(64 + 64, 64, n=1)
+
         #bottom up
-        self.down_p3 = Conv(128, 128, k = 3, s = 2)
+        if self.use_p2:
+            self.down_p2 = Conv(64, 64, k=3, s=2)
+            self.c2f_n3 = C2f(64 + 128, 128, n=1)
+            self.down_p3 = Conv(128, 128, k=3, s=2)
+        else:
+            self.down_p3 = Conv(128, 128, k = 3, s = 2)
         self.c2f_n4 = C2f(128 + 256, 256, n=1)
 
         self.down_p4 = Conv(256, 256, k=3, s=2)
         self.c2f_n5 = C2f(256 + 256, 512, n=1)
     
 
-    def forward(self, p3, p4, p5):
+    def forward(self, *features):
+        if self.use_p2:
+            p2, p3, p4, p5 = features
+        else:
+            p3, p4, p5 = features
+
         # top-down path
         p5_reduced = self.reduce_p5(p5)
         p5_up = F.interpolate(p5_reduced, scale_factor=2, mode="nearest")
@@ -37,6 +52,26 @@ class YOLOv8Neck(nn.Module):
 
         p3_fused = torch.cat([p4_up, p3], dim=1)
         p3_out = self.c2f_p3(p3_fused)
+
+        if self.use_p2:
+            p3_reduced = self.reduce_p3(p3_out)
+            p3_up = F.interpolate(p3_reduced, scale_factor=2, mode="nearest")
+            p2_fused = torch.cat([p3_up, p2], dim=1)
+            p2_out = self.c2f_p2(p2_fused)
+
+            n3 = self.down_p2(p2_out)
+            n3 = torch.cat([n3, p3_out], dim=1)
+            n3 = self.c2f_n3(n3)
+
+            n4 = self.down_p3(n3)
+            n4 = torch.cat([n4, p4_out], dim=1)
+            n4 = self.c2f_n4(n4)
+
+            n5 = self.down_p4(n4)
+            n5 = torch.cat([n5, p5_reduced], dim=1)
+            n5 = self.c2f_n5(n5)
+
+            return p2_out, n3, n4, n5
 
         # bottom-up path
         n4 = self.down_p3(p3_out)

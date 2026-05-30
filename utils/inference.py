@@ -47,9 +47,15 @@ def restore_boxes(boxes: torch.Tensor, meta: dict) -> torch.Tensor:
 
 
 def load_model(checkpoint_path: str | Path, num_classes: int, device: torch.device):
-    model = YOLOv8Scratch(num_classes=num_classes, pretrained_backbone=False, use_cspdarknet=True)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    model_config = checkpoint.get("model_config", {}) if isinstance(checkpoint, dict) else {}
+    model = YOLOv8Scratch(
+        num_classes=num_classes,
+        pretrained_backbone=False,
+        use_cspdarknet=bool(model_config.get("use_cspdarknet", True)),
+        use_p2=bool(model_config.get("use_p2", False)),
+    )
     model.load_state_dict(state)
     model.to(device).eval()
     return model, checkpoint if isinstance(checkpoint, dict) else {}
