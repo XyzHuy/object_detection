@@ -160,7 +160,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="predictions.json")
     parser.add_argument("--data_root", default="final_public/public")
     parser.add_argument("--split", default="val")
-    parser.add_argument("--img_size", type=int, default=512)
+    parser.add_argument("--img_size", type=int, default=640)
     parser.add_argument("--conf_threshold", type=float, default=0.001)
     parser.add_argument(
         "--class_thresholds",

@@ -58,7 +58,7 @@ def main() -> None:
     model, _ = load_model(checkpoint_path, len(classes), device)
 
     class_thresholds = load_class_thresholds(threshold_path, classes) if threshold_config else None
-    img_size = args.img_size or int(threshold_config.get("img_size", 512))
+    img_size = args.img_size or int(threshold_config.get("img_size", 640))
     conf_threshold = args.conf_threshold
     if conf_threshold is None:
         conf_threshold = float(threshold_config.get("base_conf_threshold", 0.001))
