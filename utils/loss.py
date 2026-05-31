@@ -74,6 +74,8 @@ class YOLOv8Loss(nn.Module):
         cls_gain: float = 0.5,
         dfl_gain: float = 1.5,
         class_weights: torch.Tensor | list[float] | None = None,
+        focal_gamma: float = 0.0,
+        focal_alpha: float = -1.0,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -85,6 +87,8 @@ class YOLOv8Loss(nn.Module):
         self.box_gain = box_gain
         self.cls_gain = cls_gain
         self.dfl_gain = dfl_gain
+        self.focal_gamma = focal_gamma
+        self.focal_alpha = focal_alpha
         if class_weights is None:
             weights = torch.ones(num_classes, dtype=torch.float32)
         else:
@@ -123,7 +127,16 @@ class YOLOv8Loss(nn.Module):
         target_scores_sum = target_scores.sum().clamp(min=1.0)
 
         cls_weight = torch.where(target_scores > 0, self.class_weights.to(device), 1.0)
-        cls_loss = (self.bce(cls_logits, target_scores) * cls_weight).sum() / target_scores_sum
+        cls_loss_raw = self.bce(cls_logits, target_scores)
+        if self.focal_gamma > 0:
+            pred_prob = cls_logits.sigmoid()
+            p_t = target_scores * pred_prob + (1.0 - target_scores) * (1.0 - pred_prob)
+            focal_weight = (1.0 - p_t).clamp(min=0).pow(self.focal_gamma)
+            if 0 <= self.focal_alpha <= 1:
+                alpha_factor = target_scores * self.focal_alpha + (1.0 - target_scores) * (1.0 - self.focal_alpha)
+                focal_weight = focal_weight * alpha_factor
+            cls_loss_raw = cls_loss_raw * focal_weight
+        cls_loss = (cls_loss_raw * cls_weight).sum() / target_scores_sum
 
         if fg_mask.any():
             weight = target_scores.sum(dim=-1)[fg_mask]
