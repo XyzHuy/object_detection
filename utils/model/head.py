@@ -152,6 +152,7 @@ class YOLOv8DetectHead(nn.Module):
         channels=(128, 256, 512),
         reg_max=16,
         strides=(8, 16, 32),
+        head_depth: int = 2,
     ):
         super().__init__()
 
@@ -160,6 +161,7 @@ class YOLOv8DetectHead(nn.Module):
         self.num_outputs = num_classes + 4 * reg_max
         self.num_layers = len(channels)
         self.strides = strides
+        head_depth = max(int(head_depth), 1)
 
         # Box regression branch
         self.box_heads = nn.ModuleList()
@@ -173,8 +175,10 @@ class YOLOv8DetectHead(nn.Module):
 
             self.box_heads.append(
                 nn.Sequential(
-                    Conv(c, box_hidden, k=3, s=1),
-                    Conv(box_hidden, box_hidden, k=3, s=1),
+                    *[
+                        Conv(c if idx == 0 else box_hidden, box_hidden, k=3, s=1)
+                        for idx in range(head_depth)
+                    ],
                     nn.Conv2d(box_hidden, 4 * reg_max, kernel_size=1),
                 )
             )
@@ -184,8 +188,10 @@ class YOLOv8DetectHead(nn.Module):
 
             self.cls_heads.append(
                 nn.Sequential(
-                    Conv(c, cls_hidden, k=3, s=1),
-                    Conv(cls_hidden, cls_hidden, k=3, s=1),
+                    *[
+                        Conv(c if idx == 0 else cls_hidden, cls_hidden, k=3, s=1)
+                        for idx in range(head_depth)
+                    ],
                     nn.Conv2d(cls_hidden, num_classes, kernel_size=1),
                 )
             )

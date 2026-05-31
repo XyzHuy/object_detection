@@ -39,6 +39,9 @@ DEFAULT_SEED = 42
 DEFAULT_NUM_RUNS = 1
 DEFAULT_EMA_DECAY = 0.9999
 DEFAULT_MOSAIC_P = 0.3
+DEFAULT_NECK_DEPTH = 2
+DEFAULT_HEAD_DEPTH = 3
+DEFAULT_POSITIVE_FOCUS_CLASSES = "chair,car"
 
 
 def experiment_name() -> str:
@@ -129,6 +132,12 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
     torch.backends.cudnn.benchmark = False
     if deterministic:
         torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def parse_class_list(text: str | None) -> list[str]:
+    if not text:
+        return []
+    return [item.strip() for item in text.split(",") if item.strip()]
 
 
 class ModelEMA:
@@ -315,7 +324,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img_size", type=int, default=DEFAULT_IMG_SIZE)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--num_workers", type=int, default=6)
+    parser.add_argument("--num_workers", type=int, default=3)
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--backbone_lr", type=float, default=DEFAULT_BACKBONE_LR)
     parser.add_argument("--weight_decay", type=float, default=DEFAULT_WEIGHT_DECAY)
@@ -370,10 +379,37 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Anisotropically scale train images to synthesize under-represented box-shape buckets per class before Albumentations.",
     )
+    parser.add_argument(
+        "--positive_sampling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use weighted train sampling to reduce empty-image dominance and oversample weak/small-object positives.",
+    )
+    parser.add_argument(
+        "--positive_focus_classes",
+        default=DEFAULT_POSITIVE_FOCUS_CLASSES,
+        help="Comma-separated classes that get extra sampling weight, e.g. chair,car. Empty string disables focus boost.",
+    )
+    parser.add_argument("--positive_empty_weight", type=float, default=0.2)
+    parser.add_argument("--positive_focus_class_boost", type=float, default=1.5)
+    parser.add_argument("--positive_tiny_box_boost", type=float, default=1.8)
+    parser.add_argument("--positive_small_box_boost", type=float, default=1.3)
+    parser.add_argument(
+        "--neck_depth",
+        type=int,
+        default=DEFAULT_NECK_DEPTH,
+        help="C2f block depth in the PAN/FPN neck. 1 matches the previous baseline; 2 is a stronger neck.",
+    )
+    parser.add_argument(
+        "--head_depth",
+        type=int,
+        default=DEFAULT_HEAD_DEPTH,
+        help="Number of Conv layers before each detect output. 2 matches the previous baseline; 3 adds light head depth.",
+    )
     parser.add_argument("--scratch_backbone", action="store_true")
     parser.add_argument(
         "--p2_head",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Add a stride-4 P2 detection head for small objects. Starts a new incompatible checkpoint architecture.",
     )
@@ -394,6 +430,19 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--ema_decay must be in [0, 1)")
     if not 0.0 <= args.mosaic_p <= 1.0:
         raise ValueError("--mosaic_p must be in [0, 1]")
+    if args.neck_depth < 1:
+        raise ValueError("--neck_depth must be >= 1")
+    if args.head_depth < 1:
+        raise ValueError("--head_depth must be >= 1")
+    if args.positive_empty_weight < 0:
+        raise ValueError("--positive_empty_weight must be >= 0")
+    if args.positive_focus_class_boost <= 0:
+        raise ValueError("--positive_focus_class_boost must be > 0")
+    if args.positive_tiny_box_boost <= 0:
+        raise ValueError("--positive_tiny_box_boost must be > 0")
+    if args.positive_small_box_boost <= 0:
+        raise ValueError("--positive_small_box_boost must be > 0")
+    args.positive_focus_classes = parse_class_list(args.positive_focus_classes)
     return args
 
 
@@ -429,7 +478,20 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         box_shape_equalizer=args.box_shape_equalizer,
         mosaic=args.mosaic and not args.no_aug,
         mosaic_p=args.mosaic_p,
+        positive_sampling=args.positive_sampling,
+        positive_focus_classes=args.positive_focus_classes,
+        positive_empty_weight=args.positive_empty_weight,
+        positive_focus_class_boost=args.positive_focus_class_boost,
+        positive_tiny_box_boost=args.positive_tiny_box_boost,
+        positive_small_box_boost=args.positive_small_box_boost,
     )
+    if args.positive_sampling:
+        sampling_stats = getattr(train_loader.dataset, "positive_sampling_stats", None)
+        if sampling_stats is not None:
+            logger.info(
+                "Positive sampling stats: %s",
+                json.dumps(sampling_stats, ensure_ascii=False, sort_keys=True),
+            )
     if args.box_type_equalizer:
         equalizer = getattr(train_loader.dataset, "box_type_equalizer", None)
         if equalizer is not None:
@@ -459,11 +521,15 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         pretrained_backbone=not args.scratch_backbone,
         use_cspdarknet=not args.scratch_backbone,
         use_p2=args.p2_head,
+        neck_depth=args.neck_depth,
+        head_depth=args.head_depth,
     ).to(device)
     model_config = {
         "use_p2": args.p2_head,
         "use_cspdarknet": not args.scratch_backbone,
         "backbone_name": "cspdarknet53",
+        "neck_depth": args.neck_depth,
+        "head_depth": args.head_depth,
     }
     ema = ModelEMA(model, decay=args.ema_decay) if args.ema else None
     class_weights, class_counts = compute_class_weights(

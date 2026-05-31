@@ -6,6 +6,7 @@ import numpy as np
 from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import WeightedRandomSampler
 from typing import Optional, Callable, List, Tuple, Dict
 import torchvision.transforms.functional as trans_func
 import torchvision.transforms as trans
@@ -846,9 +847,77 @@ class CustomDataset(Dataset):
 
         self._normalize = trans.Normalize(mean=[0.485, 0.456, 0.406],
                                           std=[0.229, 0.224, 0.225])
+        self.positive_sampling_stats = None
 
     def __len__(self):
         return len(self.images)
+
+    def positive_sampling_weights(
+        self,
+        focus_classes: Optional[List[str]] = None,
+        empty_weight: float = 0.2,
+        focus_class_boost: float = 1.5,
+        tiny_box_boost: float = 1.8,
+        small_box_boost: float = 1.3,
+    ) -> torch.Tensor:
+        focus_set = set(focus_classes or [])
+        counts_by_class = {class_name: 0 for class_name in self.classes}
+        for anns in self.ann_by_image_id.values():
+            for ann in anns:
+                class_name = ann["class"]
+                if class_name in counts_by_class:
+                    counts_by_class[class_name] += 1
+
+        max_count = max(counts_by_class.values()) if counts_by_class else 1
+        class_weights = {
+            class_name: (max_count / max(count, 1)) ** 0.5
+            for class_name, count in counts_by_class.items()
+        }
+
+        weights = []
+        empty_images = 0
+        for image_info in self.images:
+            anns = self.ann_by_image_id.get(image_info["id"], [])
+            if not anns:
+                empty_images += 1
+                weights.append(float(empty_weight))
+                continue
+
+            image_area = max(float(image_info["width"] * image_info["height"]), 1.0)
+            contributions = []
+            for ann in anns:
+                class_name = ann["class"]
+                x1, y1, x2, y2 = ann["bbox"]
+                box_area_ratio = max(float(x2 - x1), 0.0) * max(float(y2 - y1), 0.0) / image_area
+                contribution = class_weights.get(class_name, 1.0)
+                if class_name in focus_set:
+                    contribution *= focus_class_boost
+                if box_area_ratio < 0.01:
+                    contribution *= tiny_box_boost
+                elif box_area_ratio < 0.05:
+                    contribution *= small_box_boost
+                contributions.append(contribution)
+
+            weights.append(float(1.0 + max(contributions) + 0.25 * sum(contributions) / len(contributions)))
+
+        weights_tensor = torch.tensor(weights, dtype=torch.double).clamp(min=1e-6)
+        self.positive_sampling_stats = {
+            "empty_images": empty_images,
+            "empty_weight": empty_weight,
+            "focus_classes": sorted(focus_set),
+            "focus_class_boost": focus_class_boost,
+            "tiny_box_boost": tiny_box_boost,
+            "small_box_boost": small_box_boost,
+            "class_counts": counts_by_class,
+            "class_weights": {
+                class_name: round(float(weight), 6)
+                for class_name, weight in class_weights.items()
+            },
+            "image_weight_min": round(float(weights_tensor.min()), 6),
+            "image_weight_mean": round(float(weights_tensor.mean()), 6),
+            "image_weight_max": round(float(weights_tensor.max()), 6),
+        }
+        return weights_tensor
 
     def load_raw_sample(self, idx: int) -> Tuple[Image.Image, dict]:
         img_info = self.images[idx]
@@ -939,6 +1008,12 @@ def build_dataloader(
     box_shape_equalizer_p: float = 0.5,
     mosaic: bool = False,
     mosaic_p: float = 0.5,
+    positive_sampling: bool = False,
+    positive_focus_classes: Optional[List[str]] = None,
+    positive_empty_weight: float = 0.2,
+    positive_focus_class_boost: float = 1.5,
+    positive_tiny_box_boost: float = 1.8,
+    positive_small_box_boost: float = 1.3,
 ) -> DataLoader:
 
     dataset = CustomDataset(
@@ -960,12 +1035,29 @@ def build_dataloader(
         generator = torch.Generator()
         generator.manual_seed(seed)
 
+    sampler = None
     shuffle = (split == "train")
+    if positive_sampling and split == "train":
+        weights = dataset.positive_sampling_weights(
+            focus_classes=positive_focus_classes,
+            empty_weight=positive_empty_weight,
+            focus_class_boost=positive_focus_class_boost,
+            tiny_box_boost=positive_tiny_box_boost,
+            small_box_boost=positive_small_box_boost,
+        )
+        sampler = WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(dataset),
+            replacement=True,
+            generator=generator,
+        )
+        shuffle = False
 
     loader = DataLoader(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=pin_memory and torch.cuda.is_available(),

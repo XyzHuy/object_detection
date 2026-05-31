@@ -13,6 +13,8 @@ class YOLOv8Scratch(nn.Module):
         backbone_name="cspdarknet53",
         use_cspdarknet=True,
         use_p2=False,
+        neck_depth=1,
+        head_depth=2,
     ):
         super().__init__()
         self.use_p2 = use_p2
@@ -27,13 +29,14 @@ class YOLOv8Scratch(nn.Module):
             )
         else:
             self.backbone = YOLOv8Backbone(use_p2=use_p2)
-        self.neck = YOLOv8Neck(use_p2=use_p2)
+        self.neck = YOLOv8Neck(use_p2=use_p2, c2f_depth=neck_depth)
 
         self.head = YOLOv8DetectHead(
             num_classes=num_classes,
             channels=head_channels,
             reg_max=16,
             strides=head_strides,
+            head_depth=head_depth,
         )
 
     def forward(self, x):

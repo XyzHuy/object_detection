@@ -55,6 +55,8 @@ def load_model(checkpoint_path: str | Path, num_classes: int, device: torch.devi
         pretrained_backbone=False,
         use_cspdarknet=bool(model_config.get("use_cspdarknet", True)),
         use_p2=bool(model_config.get("use_p2", False)),
+        neck_depth=int(model_config.get("neck_depth", 1)),
+        head_depth=int(model_config.get("head_depth", 2)),
     )
     model.load_state_dict(state)
     model.to(device).eval()

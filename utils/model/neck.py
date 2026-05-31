@@ -5,33 +5,34 @@ from .common import Conv, C2f
 
 
 class YOLOv8Neck(nn.Module):
-    def __init__(self, use_p2: bool = False):
+    def __init__(self, use_p2: bool = False, c2f_depth: int = 1):
         super().__init__()
         self.use_p2 = use_p2
+        c2f_depth = max(int(c2f_depth), 1)
 
 
         #top down
         self.reduce_p5 = Conv(512, 256, k =1 , s = 1)
-        self.c2f_p4 = C2f(256 + 256, 256, n =1)
+        self.c2f_p4 = C2f(256 + 256, 256, n=c2f_depth)
 
         self.reduce_p4 = Conv(256, 128, k = 1, s = 1)
-        self.c2f_p3 = C2f(128 + 128, 128 , n = 1)
+        self.c2f_p3 = C2f(128 + 128, 128, n=c2f_depth)
 
         if self.use_p2:
             self.reduce_p3 = Conv(128, 64, k=1, s=1)
-            self.c2f_p2 = C2f(64 + 64, 64, n=1)
+            self.c2f_p2 = C2f(64 + 64, 64, n=c2f_depth)
 
         #bottom up
         if self.use_p2:
             self.down_p2 = Conv(64, 64, k=3, s=2)
-            self.c2f_n3 = C2f(64 + 128, 128, n=1)
+            self.c2f_n3 = C2f(64 + 128, 128, n=c2f_depth)
             self.down_p3 = Conv(128, 128, k=3, s=2)
         else:
             self.down_p3 = Conv(128, 128, k = 3, s = 2)
-        self.c2f_n4 = C2f(128 + 256, 256, n=1)
+        self.c2f_n4 = C2f(128 + 256, 256, n=c2f_depth)
 
         self.down_p4 = Conv(256, 256, k=3, s=2)
-        self.c2f_n5 = C2f(256 + 256, 512, n=1)
+        self.c2f_n5 = C2f(256 + 256, 512, n=c2f_depth)
     
 
     def forward(self, *features):
