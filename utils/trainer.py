@@ -131,6 +131,16 @@ def set_sampler_epoch(loader, epoch: int) -> None:
         sampler.set_epoch(epoch)
 
 
+def per_device_batch_size(global_batch_size: int, world_size: int) -> int:
+    if world_size <= 1:
+        return global_batch_size
+    if global_batch_size < world_size:
+        raise ValueError("--batch_size must be >= WORLD_SIZE when using DDP")
+    if global_batch_size % world_size != 0:
+        raise ValueError("--batch_size must be divisible by WORLD_SIZE when using DDP")
+    return global_batch_size // world_size
+
+
 def load_classes(data_root: str | Path, split: str = "train") -> list[str]:
     annotation_path = Path(data_root) / "annotations" / f"{split}.json"
     with annotation_path.open("r", encoding="utf-8") as file:
@@ -600,6 +610,7 @@ def train_single_run(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     classes = load_classes(args.data_root)
     run_seed = args.seed + run_idx if args.seed >= 0 else None
+    local_batch_size = per_device_batch_size(args.batch_size, world_size)
 
     logger.info("Starting training run %d/%d", run_idx + 1, args.num_runs)
     logger.info("Log file: %s", log_path)
@@ -607,6 +618,11 @@ def train_single_run(
     logger.info("Args: %s", json.dumps(vars(args), ensure_ascii=False, sort_keys=True))
     logger.info("Device: %s", device)
     logger.info("Distributed: enabled=%s rank=%d local_rank=%d world_size=%d", distributed, rank, local_rank, world_size)
+    logger.info(
+        "Batch size: global=%d per_device=%d",
+        args.batch_size,
+        local_batch_size,
+    )
     logger.info("Classes (%d): %s", len(classes), ", ".join(classes))
     logger.info("Run index: %d", run_idx)
 
@@ -619,7 +635,7 @@ def train_single_run(
     train_loader = build_dataloader(
         args.data_root,
         split="train",
-        batch_size=args.batch_size,
+        batch_size=local_batch_size,
         num_workers=args.num_workers,
         transforms=transforms,
         img_size=args.img_size,
@@ -664,7 +680,7 @@ def train_single_run(
         val_loader = build_dataloader(
             args.data_root,
             split="val",
-            batch_size=args.batch_size,
+            batch_size=local_batch_size,
             num_workers=args.num_workers,
             transforms=None,
             img_size=args.img_size,
