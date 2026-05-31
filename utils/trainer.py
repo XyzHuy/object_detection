@@ -46,8 +46,6 @@ DEFAULT_NECK_DEPTH = 2
 DEFAULT_HEAD_DEPTH = 3
 DEFAULT_POSITIVE_FOCUS_CLASSES = "chair,car"
 DEFAULT_CLASS_WEIGHT_OVERRIDES = ""
-DEFAULT_FOCAL_GAMMA = 0.0
-DEFAULT_FOCAL_ALPHA = -1.0
 
 
 def experiment_name() -> str:
@@ -465,18 +463,6 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Renormalize class weights to mean 1 after applying overrides.",
     )
-    parser.add_argument(
-        "--focal_gamma",
-        type=float,
-        default=DEFAULT_FOCAL_GAMMA,
-        help="Optional focal modulation gamma for classification BCE. 0 disables focal loss.",
-    )
-    parser.add_argument(
-        "--focal_alpha",
-        type=float,
-        default=DEFAULT_FOCAL_ALPHA,
-        help="Optional focal alpha in [0, 1]. Set <0 to disable alpha balancing.",
-    )
     parser.add_argument("--freeze_backbone_epochs", type=int, default=DEFAULT_FREEZE_BACKBONE_EPOCHS)
     parser.add_argument("--early_stop_patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
     parser.add_argument("--min_delta", type=float, default=DEFAULT_MIN_DELTA)
@@ -581,10 +567,6 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--positive_tiny_box_boost must be > 0")
     if args.positive_small_box_boost <= 0:
         raise ValueError("--positive_small_box_boost must be > 0")
-    if args.focal_gamma < 0:
-        raise ValueError("--focal_gamma must be >= 0")
-    if args.focal_alpha > 1:
-        raise ValueError("--focal_alpha must be <= 1")
     args.positive_focus_classes = parse_class_list(args.positive_focus_classes)
     args.class_weight_overrides = parse_class_weight_overrides(args.class_weight_overrides)
     return args
@@ -736,10 +718,7 @@ def train_single_run(
         strides=model.head.strides,
         reg_max=model.head.reg_max,
         class_weights=class_weights,
-        focal_gamma=args.focal_gamma,
-        focal_alpha=args.focal_alpha,
     )
-    logger.info("Classification focal loss: gamma=%.6g alpha=%.6g", args.focal_gamma, args.focal_alpha)
 
     optimizer = build_optimizer(
         model,
