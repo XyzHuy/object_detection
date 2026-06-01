@@ -1,12 +1,14 @@
 import os
 import json
+import math
 import random
 import torch
 import numpy as np
 from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.data import WeightedRandomSampler
+from torch.utils.data import Sampler, WeightedRandomSampler
+from torch.utils.data.distributed import DistributedSampler
 from typing import Optional, Callable, List, Tuple, Dict
 import torchvision.transforms.functional as trans_func
 import torchvision.transforms as trans
@@ -988,6 +990,62 @@ def seed_worker(worker_id: int) -> None:
     random.seed(worker_seed)
 
 
+class DistributedWeightedSampler(Sampler[int]):
+    """
+    Weighted replacement sampler split across DDP ranks.
+
+    It mirrors DistributedSampler's rank slicing but draws from a shared
+    weighted multinomial sequence each epoch, so positive-focused sampling
+    still works under torchrun.
+    """
+
+    def __init__(
+        self,
+        weights: torch.Tensor,
+        num_replicas: int,
+        rank: int,
+        replacement: bool = True,
+        seed: int = 0,
+        drop_last: bool = False,
+    ):
+        if num_replicas <= 0:
+            raise ValueError("num_replicas must be positive")
+        if not 0 <= rank < num_replicas:
+            raise ValueError("rank must be in [0, num_replicas)")
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.replacement = replacement
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 0
+
+        dataset_size = len(self.weights)
+        if self.drop_last and dataset_size % self.num_replicas != 0:
+            self.num_samples = math.ceil((dataset_size - self.num_replicas) / self.num_replicas)
+        else:
+            self.num_samples = math.ceil(dataset_size / self.num_replicas)
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        indices = torch.multinomial(
+            self.weights,
+            self.total_size,
+            replacement=self.replacement,
+            generator=generator,
+        ).tolist()
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+        return iter(indices)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+
 # Build dataloader
 
 
@@ -1014,6 +1072,9 @@ def build_dataloader(
     positive_focus_class_boost: float = 1.5,
     positive_tiny_box_boost: float = 1.8,
     positive_small_box_boost: float = 1.3,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DataLoader:
 
     dataset = CustomDataset(
@@ -1045,11 +1106,31 @@ def build_dataloader(
             tiny_box_boost=positive_tiny_box_boost,
             small_box_boost=positive_small_box_boost,
         )
-        sampler = WeightedRandomSampler(
-            weights=weights,
-            num_samples=len(dataset),
-            replacement=True,
-            generator=generator,
+        if distributed:
+            sampler = DistributedWeightedSampler(
+                weights=weights,
+                num_replicas=world_size,
+                rank=rank,
+                replacement=True,
+                seed=seed or 0,
+                drop_last=drop_last,
+            )
+        else:
+            sampler = WeightedRandomSampler(
+                weights=weights,
+                num_samples=len(dataset),
+                replacement=True,
+                generator=generator,
+            )
+        shuffle = False
+    elif distributed:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle,
+            seed=seed or 0,
+            drop_last=drop_last,
         )
         shuffle = False
 

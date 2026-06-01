@@ -123,7 +123,8 @@ class YOLOv8Loss(nn.Module):
         target_scores_sum = target_scores.sum().clamp(min=1.0)
 
         cls_weight = torch.where(target_scores > 0, self.class_weights.to(device), 1.0)
-        cls_loss = (self.bce(cls_logits, target_scores) * cls_weight).sum() / target_scores_sum
+        cls_loss_raw = self.bce(cls_logits, target_scores)
+        cls_loss = (cls_loss_raw * cls_weight).sum() / target_scores_sum
 
         if fg_mask.any():
             weight = target_scores.sum(dim=-1)[fg_mask]

@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import math
+import os
 import random
 import sys
 from datetime import datetime
@@ -12,6 +13,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
@@ -42,6 +45,7 @@ DEFAULT_MOSAIC_P = 0.3
 DEFAULT_NECK_DEPTH = 2
 DEFAULT_HEAD_DEPTH = 3
 DEFAULT_POSITIVE_FOCUS_CLASSES = "chair,car"
+DEFAULT_CLASS_WEIGHT_OVERRIDES = ""
 
 
 def experiment_name() -> str:
@@ -78,6 +82,61 @@ def setup_logger(log_dir: str | Path) -> tuple[logging.Logger, Path]:
     logger.addHandler(console_handler)
 
     return logger, log_path
+
+
+def null_logger() -> logging.Logger:
+    logger = logging.getLogger(f"trainer.rank{os.environ.get('RANK', 'local')}")
+    logger.setLevel(logging.CRITICAL)
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+    return logger
+
+
+def setup_distributed() -> tuple[bool, int, int, int]:
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        return False, 0, 0, 1
+
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend)
+    return True, rank, local_rank, world_size
+
+
+def cleanup_distributed() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
+
+
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, DDP) else model
+
+
+def set_sampler_epoch(loader, epoch: int) -> None:
+    sampler = getattr(loader, "sampler", None)
+    if hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
+
+
+def per_device_batch_size(global_batch_size: int, world_size: int) -> int:
+    if world_size <= 1:
+        return global_batch_size
+    if global_batch_size < world_size:
+        raise ValueError("--batch_size must be >= WORLD_SIZE when using DDP")
+    if global_batch_size % world_size != 0:
+        raise ValueError("--batch_size must be divisible by WORLD_SIZE when using DDP")
+    return global_batch_size // world_size
 
 
 def load_classes(data_root: str | Path, split: str = "train") -> list[str]:
@@ -119,6 +178,7 @@ def move_targets_to_device(targets: list[dict], device: torch.device) -> list[di
 
 
 def set_backbone_trainable(model: torch.nn.Module, trainable: bool) -> None:
+    model = unwrap_model(model)
     backbone = getattr(model, "backbone", None)
     if hasattr(backbone, "set_feature_extractor_trainable"):
         backbone.set_feature_extractor_trainable(trainable)
@@ -138,6 +198,43 @@ def parse_class_list(text: str | None) -> list[str]:
     if not text:
         return []
     return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def parse_class_weight_overrides(text: str | None) -> dict[str, float]:
+    if not text:
+        return {}
+    overrides = {}
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError("--class_weight_overrides items must be class=multiplier")
+        class_name, value = item.split("=", 1)
+        multiplier = float(value)
+        if multiplier <= 0:
+            raise ValueError("--class_weight_overrides multipliers must be > 0")
+        overrides[class_name.strip()] = multiplier
+    return overrides
+
+
+def apply_class_weight_overrides(
+    class_weights: torch.Tensor,
+    classes: list[str],
+    overrides: dict[str, float],
+    renormalize: bool,
+) -> torch.Tensor:
+    if not overrides:
+        return class_weights
+    weights = class_weights.clone()
+    class_to_idx = {class_name: idx for idx, class_name in enumerate(classes)}
+    for class_name, multiplier in overrides.items():
+        if class_name not in class_to_idx:
+            raise ValueError(f"Unknown class in --class_weight_overrides: {class_name}")
+        weights[class_to_idx[class_name]] *= multiplier
+    if renormalize:
+        weights = weights / weights.mean().clamp(min=1e-12)
+    return weights
 
 
 class ModelEMA:
@@ -176,10 +273,13 @@ def train_one_epoch(
     amp: bool,
     epoch: int,
     ema: ModelEMA | None = None,
+    distributed: bool = False,
+    rank: int = 0,
 ) -> dict:
     model.train()
     running = {"loss": 0.0, "box": 0.0, "cls": 0.0, "dfl": 0.0}
-    progress = tqdm(loader, desc=f"train {epoch}", leave=False)
+    seen_samples = 0
+    progress = tqdm(loader, desc=f"train {epoch}", leave=False, disable=distributed and rank != 0)
 
     for images, targets in progress:
         images = images.to(device, non_blocking=True)
@@ -197,18 +297,31 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
         if ema is not None and (not amp or scaler.get_scale() >= scale_before_step):
-            ema.update(model)
+            ema.update(unwrap_model(model))
 
         batch_size = images.shape[0]
+        seen_samples += batch_size
         running["loss"] += float(loss_items.loss.detach()) * batch_size
         running["box"] += float(loss_items.box_loss) * batch_size
         running["cls"] += float(loss_items.cls_loss) * batch_size
         running["dfl"] += float(loss_items.dfl_loss) * batch_size
-        seen = max(progress.n + 1, 1) * batch_size
-        progress.set_postfix({key: value / seen for key, value in running.items()})
+        if not distributed or rank == 0:
+            progress.set_postfix({key: value / max(seen_samples, 1) for key, value in running.items()})
 
-    denom = len(loader.dataset)
-    return {key: value / max(denom, 1) for key, value in running.items()}
+    totals = torch.tensor(
+        [running["loss"], running["box"], running["cls"], running["dfl"], float(seen_samples)],
+        device=device,
+        dtype=torch.float64,
+    )
+    if distributed:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    denom = max(float(totals[-1].item()), 1.0)
+    return {
+        "loss": float(totals[0].item() / denom),
+        "box": float(totals[1].item() / denom),
+        "cls": float(totals[2].item() / denom),
+        "dfl": float(totals[3].item() / denom),
+    }
 
 
 @torch.no_grad()
@@ -324,7 +437,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img_size", type=int, default=DEFAULT_IMG_SIZE)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--num_workers", type=int, default=3)
+    parser.add_argument("--num_workers", type=int, default=6)
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--backbone_lr", type=float, default=DEFAULT_BACKBONE_LR)
     parser.add_argument("--weight_decay", type=float, default=DEFAULT_WEIGHT_DECAY)
@@ -338,6 +451,17 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Use sqrt-inverse class weights from the train split for positive classification loss.",
+    )
+    parser.add_argument(
+        "--class_weight_overrides",
+        default=DEFAULT_CLASS_WEIGHT_OVERRIDES,
+        help="Comma-separated positive class-weight multipliers, e.g. chair=1.6,car=1.1.",
+    )
+    parser.add_argument(
+        "--class_weight_renorm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Renormalize class weights to mean 1 after applying overrides.",
     )
     parser.add_argument("--freeze_backbone_epochs", type=int, default=DEFAULT_FREEZE_BACKBONE_EPOCHS)
     parser.add_argument("--early_stop_patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
@@ -415,6 +539,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Set to -1 to disable fixed seeding.")
     parser.add_argument("--deterministic", action="store_true", help="Use deterministic PyTorch kernels when available.")
+    parser.add_argument("--local_rank", type=int, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     args.flat_checkpoint_dir = False
@@ -443,20 +568,43 @@ def parse_args() -> argparse.Namespace:
     if args.positive_small_box_boost <= 0:
         raise ValueError("--positive_small_box_boost must be > 0")
     args.positive_focus_classes = parse_class_list(args.positive_focus_classes)
+    args.class_weight_overrides = parse_class_weight_overrides(args.class_weight_overrides)
     return args
 
 
-def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, log_dir: Path) -> None:
-    logger, log_path = setup_logger(log_dir)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def train_single_run(
+    args: argparse.Namespace,
+    run_idx: int,
+    output_dir: Path,
+    log_dir: Path,
+    distributed: bool = False,
+    rank: int = 0,
+    local_rank: int = 0,
+    world_size: int = 1,
+) -> None:
+    if is_main_process(rank):
+        logger, log_path = setup_logger(log_dir)
+    else:
+        logger, log_path = null_logger(), None
+    if distributed and torch.cuda.is_available():
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     classes = load_classes(args.data_root)
     run_seed = args.seed + run_idx if args.seed >= 0 else None
+    local_batch_size = per_device_batch_size(args.batch_size, world_size)
 
     logger.info("Starting training run %d/%d", run_idx + 1, args.num_runs)
     logger.info("Log file: %s", log_path)
     logger.info("Output dir: %s", output_dir)
     logger.info("Args: %s", json.dumps(vars(args), ensure_ascii=False, sort_keys=True))
     logger.info("Device: %s", device)
+    logger.info("Distributed: enabled=%s rank=%d local_rank=%d world_size=%d", distributed, rank, local_rank, world_size)
+    logger.info(
+        "Batch size: global=%d per_device=%d",
+        args.batch_size,
+        local_batch_size,
+    )
     logger.info("Classes (%d): %s", len(classes), ", ".join(classes))
     logger.info("Run index: %d", run_idx)
 
@@ -469,7 +617,7 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
     train_loader = build_dataloader(
         args.data_root,
         split="train",
-        batch_size=args.batch_size,
+        batch_size=local_batch_size,
         num_workers=args.num_workers,
         transforms=transforms,
         img_size=args.img_size,
@@ -484,37 +632,42 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         positive_focus_class_boost=args.positive_focus_class_boost,
         positive_tiny_box_boost=args.positive_tiny_box_boost,
         positive_small_box_boost=args.positive_small_box_boost,
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
     )
-    if args.positive_sampling:
+    if is_main_process(rank) and args.positive_sampling:
         sampling_stats = getattr(train_loader.dataset, "positive_sampling_stats", None)
         if sampling_stats is not None:
             logger.info(
                 "Positive sampling stats: %s",
                 json.dumps(sampling_stats, ensure_ascii=False, sort_keys=True),
             )
-    if args.box_type_equalizer:
+    if is_main_process(rank) and args.box_type_equalizer:
         equalizer = getattr(train_loader.dataset, "box_type_equalizer", None)
         if equalizer is not None:
             logger.info(
                 "Box type equalizer stats: %s",
                 json.dumps(equalizer.stats(), ensure_ascii=False, sort_keys=True),
             )
-    if args.box_shape_equalizer:
+    if is_main_process(rank) and args.box_shape_equalizer:
         equalizer = getattr(train_loader.dataset, "box_shape_equalizer", None)
         if equalizer is not None:
             logger.info(
                 "Box shape equalizer stats: %s",
                 json.dumps(equalizer.stats(), ensure_ascii=False, sort_keys=True),
             )
-    val_loader = build_dataloader(
-        args.data_root,
-        split="val",
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        transforms=None,
-        img_size=args.img_size,
-        seed=run_seed + 1 if run_seed is not None else None,
-    )
+    val_loader = None
+    if is_main_process(rank):
+        val_loader = build_dataloader(
+            args.data_root,
+            split="val",
+            batch_size=local_batch_size,
+            num_workers=args.num_workers,
+            transforms=None,
+            img_size=args.img_size,
+            seed=run_seed + 1 if run_seed is not None else None,
+        )
 
     model = YOLOv8Scratch(
         num_classes=len(classes),
@@ -539,10 +692,20 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
     )
     if not args.class_weighting:
         class_weights = torch.ones_like(class_weights)
+    base_class_weights = class_weights.clone()
+    class_weights = apply_class_weight_overrides(
+        class_weights=class_weights,
+        classes=classes,
+        overrides=args.class_weight_overrides,
+        renormalize=args.class_weight_renorm,
+    )
     logger.info("Train class counts: %s", json.dumps(class_counts, ensure_ascii=False, sort_keys=True))
     logger.info(
-        "Class weighting: enabled=%s scheme=sqrt_inverse weights=%s",
+        "Class weighting: enabled=%s scheme=sqrt_inverse overrides=%s renorm=%s base_weights=%s weights=%s",
         args.class_weighting,
+        json.dumps(args.class_weight_overrides, ensure_ascii=False, sort_keys=True),
+        args.class_weight_renorm,
+        json.dumps({class_name: round(float(weight), 6) for class_name, weight in zip(classes, base_class_weights)}),
         json.dumps({class_name: round(float(weight), 6) for class_name, weight in zip(classes, class_weights)}),
     )
     logger.info(
@@ -557,7 +720,6 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         class_weights=class_weights,
     )
 
-    set_backbone_trainable(model, args.freeze_backbone_epochs <= 0)
     optimizer = build_optimizer(
         model,
         lr=args.lr,
@@ -570,6 +732,12 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
         eta_min=min(args.lr, args.backbone_lr) * 0.05,
     )
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and not args.no_amp))
+    if distributed:
+        if device.type == "cuda":
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+        else:
+            model = DDP(model, find_unused_parameters=True)
+    set_backbone_trainable(model, args.freeze_backbone_epochs <= 0)
     best_map = -1.0
     best_epoch = 0
     alter_best_epoch = 0
@@ -585,6 +753,7 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
     logger.info("Model config: %s", json.dumps(model_config, ensure_ascii=False, sort_keys=True))
 
     for epoch in range(1, args.epochs + 1):
+        set_sampler_epoch(train_loader, epoch)
         if epoch == args.freeze_backbone_epochs + 1:
             set_backbone_trainable(model, True)
             logger.info("Unfroze CSPDarkNet feature extractor at epoch %d", epoch)
@@ -599,92 +768,104 @@ def train_single_run(args: argparse.Namespace, run_idx: int, output_dir: Path, l
             device.type == "cuda" and not args.no_amp,
             epoch,
             ema=ema,
-        )
-        eval_model = ema.ema if ema is not None else model
-        val_metrics = evaluate_model(
-            eval_model,
-            val_loader,
-            criterion,
-            device,
-            conf_threshold=args.conf_threshold,
-            iou_threshold=args.nms_iou,
-            max_det=args.max_det,
+            distributed=distributed,
+            rank=rank,
         )
         scheduler.step()
+        stop_training = False
 
-        current_lrs = scheduler.get_last_lr()
-        metrics = {
-            **train_metrics,
-            **val_metrics,
-            "lr_backbone": current_lrs[0] if current_lrs else args.backbone_lr,
-            "lr": current_lrs[-1] if current_lrs else args.lr,
-            "run": run_idx,
-            "seed": run_seed,
-            "experiment": experiment_name(),
-            "ema": ema is not None,
-        }
-        logger.info(
-            "epoch %03d/%03d | loss=%.4f box=%.4f cls=%.4f dfl=%.4f | "
-            "val_loss=%.4f mAP50=%.4f P@eval=%.4f R@eval=%.4f "
-            "P@0.25=%.4f R@0.25=%.4f P@0.50=%.4f R@0.50=%.4f preds@eval=%d | "
-            "lr_backbone=%.6g lr_head=%.6g",
-            epoch,
-            args.epochs,
-            metrics["loss"],
-            metrics["box"],
-            metrics["cls"],
-            metrics["dfl"],
-            metrics["val_loss"],
-            metrics["mAP50"],
-            metrics["precision"],
-            metrics["recall"],
-            metrics["precision@0.25"],
-            metrics["recall@0.25"],
-            metrics["precision@0.5"],
-            metrics["recall@0.5"],
-            metrics["num_predictions"],
-            metrics["lr_backbone"],
-            metrics["lr"],
-        )
-        if args.alter_best_min_map >= 0 and metrics["mAP50"] >= args.alter_best_min_map:
-            alter_best_epoch = epoch
-            alter_best_map = metrics["mAP50"]
-            save_checkpoint(output_dir / "alter_best.pth", eval_model, epoch, classes, metrics, model_config)
-            logger.info(
-                "Saved alter_best checkpoint: mAP50=%.6f at epoch %d "
-                "(latest epoch with mAP50 >= %.6f)",
-                alter_best_map,
-                alter_best_epoch,
-                args.alter_best_min_map,
+        if is_main_process(rank):
+            eval_model = ema.ema if ema is not None else unwrap_model(model)
+            val_metrics = evaluate_model(
+                eval_model,
+                val_loader,
+                criterion,
+                device,
+                conf_threshold=args.conf_threshold,
+                iou_threshold=args.nms_iou,
+                max_det=args.max_det,
             )
-        if metrics["mAP50"] > best_map + args.min_delta:
-            best_map = metrics["mAP50"]
-            best_epoch = epoch
-            epochs_without_improvement = 0
-            save_checkpoint(output_dir / "best.pth", eval_model, epoch, classes, metrics, model_config)
-            logger.info("Saved new best checkpoint: mAP50=%.6f at epoch %d", best_map, epoch)
-        else:
-            epochs_without_improvement += 1
+            current_lrs = scheduler.get_last_lr()
+            metrics = {
+                **train_metrics,
+                **val_metrics,
+                "lr_backbone": current_lrs[0] if current_lrs else args.backbone_lr,
+                "lr": current_lrs[-1] if current_lrs else args.lr,
+                "run": run_idx,
+                "seed": run_seed,
+                "experiment": experiment_name(),
+                "ema": ema is not None,
+            }
             logger.info(
-                "No mAP50 improvement for %d/%d epoch(s). Best mAP50=%.6f at epoch %d",
-                epochs_without_improvement,
-                args.early_stop_patience,
-                best_map,
-                best_epoch,
+                "epoch %03d/%03d | loss=%.4f box=%.4f cls=%.4f dfl=%.4f | "
+                "val_loss=%.4f mAP50=%.4f P@eval=%.4f R@eval=%.4f "
+                "P@0.25=%.4f R@0.25=%.4f P@0.50=%.4f R@0.50=%.4f preds@eval=%d | "
+                "lr_backbone=%.6g lr_head=%.6g",
+                epoch,
+                args.epochs,
+                metrics["loss"],
+                metrics["box"],
+                metrics["cls"],
+                metrics["dfl"],
+                metrics["val_loss"],
+                metrics["mAP50"],
+                metrics["precision"],
+                metrics["recall"],
+                metrics["precision@0.25"],
+                metrics["recall@0.25"],
+                metrics["precision@0.5"],
+                metrics["recall@0.5"],
+                metrics["num_predictions"],
+                metrics["lr_backbone"],
+                metrics["lr"],
             )
-            if args.early_stop_patience > 0 and epochs_without_improvement >= args.early_stop_patience:
+            if args.alter_best_min_map >= 0 and metrics["mAP50"] >= args.alter_best_min_map:
+                alter_best_epoch = epoch
+                alter_best_map = metrics["mAP50"]
+                save_checkpoint(output_dir / "alter_best.pth", eval_model, epoch, classes, metrics, model_config)
                 logger.info(
-                    "Early stopping at epoch %d. Best mAP50=%.6f at epoch %d",
+                    "Saved alter_best checkpoint: mAP50=%.6f at epoch %d "
+                    "(latest epoch with mAP50 >= %.6f)",
+                    alter_best_map,
                     epoch,
+                    args.alter_best_min_map,
+                )
+            if metrics["mAP50"] > best_map + args.min_delta:
+                best_map = metrics["mAP50"]
+                best_epoch = epoch
+                epochs_without_improvement = 0
+                save_checkpoint(output_dir / "best.pth", eval_model, epoch, classes, metrics, model_config)
+                logger.info("Saved new best checkpoint: mAP50=%.6f at epoch %d", best_map, epoch)
+            else:
+                epochs_without_improvement += 1
+                logger.info(
+                    "No mAP50 improvement for %d/%d epoch(s). Best mAP50=%.6f at epoch %d",
+                    epochs_without_improvement,
+                    args.early_stop_patience,
                     best_map,
                     best_epoch,
                 )
-                break
+                if args.early_stop_patience > 0 and epochs_without_improvement >= args.early_stop_patience:
+                    logger.info(
+                        "Early stopping at epoch %d. Best mAP50=%.6f at epoch %d",
+                        epoch,
+                        best_map,
+                        best_epoch,
+                    )
+                    stop_training = True
 
-    if alter_best_epoch:
-        logger.info("Training finished. Best mAP50: %.6f | alter_best mAP50: %.6f at epoch %d", best_map, alter_best_map, alter_best_epoch)
-    else:
-        logger.info("Training finished. Best mAP50: %.6f | no alter_best checkpoint met mAP50 >= %.6f", best_map, args.alter_best_min_map)
+        if distributed:
+            stop_tensor = torch.tensor(1 if stop_training else 0, device=device, dtype=torch.int)
+            dist.broadcast(stop_tensor, src=0)
+            stop_training = bool(stop_tensor.item())
+        if stop_training:
+            break
+
+    if is_main_process(rank):
+        if alter_best_epoch:
+            logger.info("Training finished. Best mAP50: %.6f | alter_best mAP50: %.6f at epoch %d", best_map, alter_best_map, alter_best_epoch)
+        else:
+            logger.info("Training finished. Best mAP50: %.6f | no alter_best checkpoint met mAP50 >= %.6f", best_map, args.alter_best_min_map)
 
 
 def main() -> None:
@@ -692,21 +873,31 @@ def main() -> None:
     if args.num_runs < 1:
         raise ValueError("--num_runs must be >= 1")
 
-    experiment = experiment_name()
-    for run_idx in range(args.num_runs):
-        output_dir = Path(args.output_dir)
-        log_dir = Path(args.log_dir)
-        if not getattr(args, "flat_checkpoint_dir", False) or args.num_runs > 1:
-            output_dir = run_dir(args.output_dir, experiment, run_idx)
-            log_dir = run_dir(args.log_dir, experiment, run_idx)
-        train_single_run(
-            args=args,
-            run_idx=run_idx,
-            output_dir=output_dir,
-            log_dir=log_dir,
-        )
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    distributed, rank, local_rank, world_size = setup_distributed()
+    try:
+        experiment = experiment_name()
+        for run_idx in range(args.num_runs):
+            output_dir = Path(args.output_dir)
+            log_dir = Path(args.log_dir)
+            if not getattr(args, "flat_checkpoint_dir", False) or args.num_runs > 1:
+                output_dir = run_dir(args.output_dir, experiment, run_idx)
+                log_dir = run_dir(args.log_dir, experiment, run_idx)
+            train_single_run(
+                args=args,
+                run_idx=run_idx,
+                output_dir=output_dir,
+                log_dir=log_dir,
+                distributed=distributed,
+                rank=rank,
+                local_rank=local_rank,
+                world_size=world_size,
+            )
+            if distributed:
+                dist.barrier()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
