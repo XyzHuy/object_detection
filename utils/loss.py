@@ -74,6 +74,8 @@ class YOLOv8Loss(nn.Module):
         cls_gain: float = 0.5,
         dfl_gain: float = 1.5,
         class_weights: torch.Tensor | list[float] | None = None,
+        quality_targets: bool = True,
+        quality_target_floor: float = 0.05,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -85,6 +87,8 @@ class YOLOv8Loss(nn.Module):
         self.box_gain = box_gain
         self.cls_gain = cls_gain
         self.dfl_gain = dfl_gain
+        self.quality_targets = quality_targets
+        self.quality_target_floor = quality_target_floor
         if class_weights is None:
             weights = torch.ones(num_classes, dtype=torch.float32)
         else:
@@ -214,7 +218,11 @@ class YOLOv8Loss(nn.Module):
                 matched_gt = assigned_gt[keep]
                 fg_mask[batch_idx, keep] = True
                 target_boxes[batch_idx, keep] = gt_boxes[matched_gt]
-                target_scores[batch_idx, keep, gt_labels[matched_gt]] = 1.0
+                if self.quality_targets:
+                    target_quality = self._quality_scores(metrics, ious, assigned_gt, keep, matched_gt)
+                else:
+                    target_quality = torch.ones_like(matched_gt, dtype=target_scores.dtype)
+                target_scores[batch_idx, keep, gt_labels[matched_gt]] = target_quality.to(target_scores.dtype)
 
         return target_boxes, target_scores, fg_mask
 
@@ -222,6 +230,31 @@ class YOLOv8Loss(nn.Module):
     def _anchors_in_boxes(anchor_points: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
         x, y = anchor_points[:, 0:1], anchor_points[:, 1:2]
         return (x >= boxes[:, 0]) & (x <= boxes[:, 2]) & (y >= boxes[:, 1]) & (y <= boxes[:, 3])
+
+    def _quality_scores(
+        self,
+        metrics: torch.Tensor,
+        ious: torch.Tensor,
+        assigned_gt: torch.Tensor,
+        keep: torch.Tensor,
+        matched_gt: torch.Tensor,
+        eps: float = 1e-9,
+    ) -> torch.Tensor:
+        matched_metrics = metrics[keep, matched_gt]
+        matched_ious = ious[keep, matched_gt].clamp(0.0, 1.0)
+
+        best_metric_per_gt = torch.zeros(metrics.shape[1], device=metrics.device)
+        best_iou_per_gt = torch.zeros(metrics.shape[1], device=metrics.device)
+        for gt_idx in matched_gt.unique():
+            assigned_to_gt = assigned_gt == gt_idx
+            if assigned_to_gt.any():
+                best_metric_per_gt[gt_idx] = metrics[assigned_to_gt, gt_idx].max()
+                best_iou_per_gt[gt_idx] = ious[assigned_to_gt, gt_idx].max()
+
+        normalized_quality = matched_metrics * best_iou_per_gt[matched_gt] / best_metric_per_gt[matched_gt].clamp(min=eps)
+        fallback_quality = matched_ious.clamp(min=self.quality_target_floor)
+        quality = torch.where(matched_metrics > eps, normalized_quality, fallback_quality)
+        return quality.clamp(min=self.quality_target_floor, max=1.0)
 
     def distribution_focal_loss(
         self,

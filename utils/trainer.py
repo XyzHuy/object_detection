@@ -25,11 +25,11 @@ from utils.metrics import detection_metrics, filter_predictions_by_score, non_ma
 from utils.model import YOLOv8Scratch
 
 
-DEFAULT_IMG_SIZE = 640
+DEFAULT_IMG_SIZE = 768
 DEFAULT_EPOCHS = 80
-DEFAULT_BATCH_SIZE = 32
-DEFAULT_LR = 3e-4
-DEFAULT_BACKBONE_LR = 5e-5
+DEFAULT_BATCH_SIZE = 20
+DEFAULT_LR = 0.0001875
+DEFAULT_BACKBONE_LR = 0.00003125
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_FREEZE_BACKBONE_EPOCHS = 5
 DEFAULT_EARLY_STOP_PATIENCE = 20
@@ -44,8 +44,9 @@ DEFAULT_EMA_DECAY = 0.9999
 DEFAULT_MOSAIC_P = 0.3
 DEFAULT_NECK_DEPTH = 2
 DEFAULT_HEAD_DEPTH = 3
-DEFAULT_POSITIVE_FOCUS_CLASSES = "chair,car"
-DEFAULT_CLASS_WEIGHT_OVERRIDES = ""
+DEFAULT_POSITIVE_FOCUS_CLASSES = "car"
+DEFAULT_CLASS_WEIGHT_OVERRIDES = "chair=1.6"
+DEFAULT_QUALITY_TARGET_FLOOR = 0.05
 
 
 def experiment_name() -> str:
@@ -437,7 +438,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img_size", type=int, default=DEFAULT_IMG_SIZE)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--num_workers", type=int, default=6)
+    parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--backbone_lr", type=float, default=DEFAULT_BACKBONE_LR)
     parser.add_argument("--weight_decay", type=float, default=DEFAULT_WEIGHT_DECAY)
@@ -462,6 +463,18 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Renormalize class weights to mean 1 after applying overrides.",
+    )
+    parser.add_argument(
+        "--quality_targets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Scale positive classification targets by assignment quality instead of using binary 1.0 targets.",
+    )
+    parser.add_argument(
+        "--quality_target_floor",
+        type=float,
+        default=DEFAULT_QUALITY_TARGET_FLOOR,
+        help="Minimum positive classification target when --quality_targets is enabled.",
     )
     parser.add_argument("--freeze_backbone_epochs", type=int, default=DEFAULT_FREEZE_BACKBONE_EPOCHS)
     parser.add_argument("--early_stop_patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
@@ -514,7 +527,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_POSITIVE_FOCUS_CLASSES,
         help="Comma-separated classes that get extra sampling weight, e.g. chair,car. Empty string disables focus boost.",
     )
-    parser.add_argument("--positive_empty_weight", type=float, default=0.2)
+    parser.add_argument("--positive_empty_weight", type=float, default=0.5)
     parser.add_argument("--positive_focus_class_boost", type=float, default=1.5)
     parser.add_argument("--positive_tiny_box_boost", type=float, default=1.8)
     parser.add_argument("--positive_small_box_boost", type=float, default=1.3)
@@ -567,6 +580,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--positive_tiny_box_boost must be > 0")
     if args.positive_small_box_boost <= 0:
         raise ValueError("--positive_small_box_boost must be > 0")
+    if not 0.0 <= args.quality_target_floor <= 1.0:
+        raise ValueError("--quality_target_floor must be in [0, 1]")
     args.positive_focus_classes = parse_class_list(args.positive_focus_classes)
     args.class_weight_overrides = parse_class_weight_overrides(args.class_weight_overrides)
     return args
@@ -718,6 +733,13 @@ def train_single_run(
         strides=model.head.strides,
         reg_max=model.head.reg_max,
         class_weights=class_weights,
+        quality_targets=args.quality_targets,
+        quality_target_floor=args.quality_target_floor,
+    )
+    logger.info(
+        "Quality targets: enabled=%s floor=%.6g",
+        args.quality_targets,
+        args.quality_target_floor,
     )
 
     optimizer = build_optimizer(
