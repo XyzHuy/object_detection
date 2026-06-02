@@ -1056,7 +1056,7 @@ def build_dataloader(
     num_workers: int = 4,
     transforms: Optional[Callable] = None,
     normalize: bool = True,
-    pin_memory: bool = True,
+    pin_memory: bool = False,
     drop_last: bool = False,
     img_size: int = 512,
     seed: Optional[int] = None,
