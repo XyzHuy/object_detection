@@ -53,7 +53,8 @@ def load_model(checkpoint_path: str | Path, num_classes: int, device: torch.devi
     model = YOLOv8Scratch(
         num_classes=num_classes,
         pretrained_backbone=False,
-        use_cspdarknet=bool(model_config.get("use_cspdarknet", True)),
+        backbone_name=str(model_config.get("backbone_name", "convnextv2_tiny")),
+        use_pretrained_backbone=bool(model_config.get("use_pretrained_backbone", True)),
         use_p2=bool(model_config.get("use_p2", False)),
         neck_depth=int(model_config.get("neck_depth", 1)),
         head_depth=int(model_config.get("head_depth", 2)),

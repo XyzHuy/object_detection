@@ -428,7 +428,7 @@ def save_checkpoint(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Train YOLOv8 with ImageNet-pretrained CSPDarkNet backbone")
+    parser = argparse.ArgumentParser("Train YOLOv8 with ImageNet-pretrained ConvNeXt V2 Tiny backbone")
     parser.add_argument("--data_root", default="final_public/public")
     parser.add_argument("--train_data", help="Submission CLI alias for ./public/annotations/train.json")
     parser.add_argument("--val_data", help="Submission CLI alias for ./public/annotations/val.json")
@@ -687,15 +687,15 @@ def train_single_run(
     model = YOLOv8Scratch(
         num_classes=len(classes),
         pretrained_backbone=not args.scratch_backbone,
-        use_cspdarknet=not args.scratch_backbone,
+        use_pretrained_backbone=not args.scratch_backbone,
         use_p2=args.p2_head,
         neck_depth=args.neck_depth,
         head_depth=args.head_depth,
     ).to(device)
     model_config = {
         "use_p2": args.p2_head,
-        "use_cspdarknet": not args.scratch_backbone,
-        "backbone_name": "cspdarknet53",
+        "use_pretrained_backbone": not args.scratch_backbone,
+        "backbone_name": "convnextv2_tiny",
         "neck_depth": args.neck_depth,
         "head_depth": args.head_depth,
     }
@@ -778,7 +778,7 @@ def train_single_run(
         set_sampler_epoch(train_loader, epoch)
         if epoch == args.freeze_backbone_epochs + 1:
             set_backbone_trainable(model, True)
-            logger.info("Unfroze CSPDarkNet feature extractor at epoch %d", epoch)
+            logger.info("Unfroze ConvNeXt V2 Tiny feature extractor at epoch %d", epoch)
 
         train_metrics = train_one_epoch(
             model,

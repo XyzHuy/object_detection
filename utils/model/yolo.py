@@ -1,6 +1,6 @@
 import torch.nn as nn
 
-from .backbone import CSPDarknetBackbone, YOLOv8Backbone
+from .backbone import ConvNeXtV2TinyBackbone, YOLOv8Backbone
 from .neck import YOLOv8Neck
 from .head import YOLOv8DetectHead
 
@@ -10,8 +10,8 @@ class YOLOv8Scratch(nn.Module):
         self,
         num_classes,
         pretrained_backbone=True,
-        backbone_name="cspdarknet53",
-        use_cspdarknet=True,
+        backbone_name="convnextv2_tiny",
+        use_pretrained_backbone=True,
         use_p2=False,
         neck_depth=1,
         head_depth=2,
@@ -21,8 +21,8 @@ class YOLOv8Scratch(nn.Module):
         head_channels = (64, 128, 256, 512) if use_p2 else (128, 256, 512)
         head_strides = (4, 8, 16, 32) if use_p2 else (8, 16, 32)
 
-        if use_cspdarknet:
-            self.backbone = CSPDarknetBackbone(
+        if use_pretrained_backbone:
+            self.backbone = ConvNeXtV2TinyBackbone(
                 model_name=backbone_name,
                 pretrained=pretrained_backbone,
                 use_p2=use_p2,

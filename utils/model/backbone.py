@@ -50,29 +50,30 @@ class YOLOv8Backbone(nn.Module):
         return p3, p4, p5
 
 
-class CSPDarknetBackbone(nn.Module):
+class ConvNeXtV2TinyBackbone(nn.Module):
     """
-    ImageNet-pretrained CSPDarkNet feature extractor with the same output
-    contract as the existing YOLOv8 backbone: P3/P4/P5 at strides 8/16/32
-    and channels 128/256/512.
+    ImageNet-pretrained ConvNeXt V2 Tiny feature extractor with the same
+    output contract as the YOLOv8 neck:
+      - P2/P3/P4/P5 at strides 4/8/16/32 and channels 64/128/256/512, or
+      - P3/P4/P5 at strides 8/16/32 and channels 128/256/512.
     """
 
     def __init__(
         self,
-        model_name: str = "cspdarknet53",
+        model_name: str = "convnextv2_tiny",
         pretrained: bool = True,
-        out_channels=(128, 256, 512),
+        out_channels=None,
         use_p2: bool = False,
     ):
         super().__init__()
         if timm is None:
-            raise ImportError("timm is required for CSPDarknetBackbone. Install it with: python3 -m pip install timm")
+            raise ImportError("timm is required for ConvNeXtV2TinyBackbone. Install it with: python3 -m pip install timm")
 
         self.use_p2 = use_p2
-        out_indices = (2, 3, 4, 5) if use_p2 else (3, 4, 5)
+        out_indices = (0, 1, 2, 3) if use_p2 else (1, 2, 3)
         expected_reductions = (4, 8, 16, 32) if use_p2 else (8, 16, 32)
-        if use_p2 and tuple(out_channels) == (128, 256, 512):
-            out_channels = (64, 128, 256, 512)
+        if out_channels is None:
+            out_channels = (64, 128, 256, 512) if use_p2 else (128, 256, 512)
 
         self.features = timm.create_model(
             model_name,

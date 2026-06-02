@@ -9,4 +9,8 @@ if __name__ == "__main__":
   --val_data ./public/annotations/val.json \
   --image_dir ./public/train/images \
   --val_image_dir ./public/val/images \
-  --checkpoint_dir ./models/"""
+  --checkpoint_dir ./models/ \
+  
+  
+
+"""
