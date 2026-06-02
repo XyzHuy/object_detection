@@ -46,6 +46,7 @@ DEFAULT_NECK_DEPTH = 2
 DEFAULT_HEAD_DEPTH = 3
 DEFAULT_POSITIVE_FOCUS_CLASSES = "car"
 DEFAULT_CLASS_WEIGHT_OVERRIDES = "chair=1.6"
+DEFAULT_CLASS_TOPK_OVERRIDES = "chair=6"
 DEFAULT_QUALITY_TARGET_FLOOR = 0.05
 
 
@@ -217,6 +218,40 @@ def parse_class_weight_overrides(text: str | None) -> dict[str, float]:
             raise ValueError("--class_weight_overrides multipliers must be > 0")
         overrides[class_name.strip()] = multiplier
     return overrides
+
+
+def parse_class_topk_overrides(text: str | None) -> dict[str, int]:
+    if not text:
+        return {}
+    overrides = {}
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError("--class_topk_overrides items must be class=top_k")
+        class_name, value = item.split("=", 1)
+        topk = int(value)
+        if topk <= 0:
+            raise ValueError("--class_topk_overrides top_k values must be > 0")
+        overrides[class_name.strip()] = topk
+    return overrides
+
+
+def build_class_topk(
+    classes: list[str],
+    default_topk: int,
+    overrides: dict[str, int],
+) -> torch.Tensor:
+    if default_topk <= 0:
+        raise ValueError("--assign_topk must be > 0")
+    topk_by_class = torch.full((len(classes),), int(default_topk), dtype=torch.long)
+    class_to_idx = {class_name: idx for idx, class_name in enumerate(classes)}
+    for class_name, topk in overrides.items():
+        if class_name not in class_to_idx:
+            raise ValueError(f"Unknown class in --class_topk_overrides: {class_name}")
+        topk_by_class[class_to_idx[class_name]] = int(topk)
+    return topk_by_class
 
 
 def apply_class_weight_overrides(
@@ -461,8 +496,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--class_weight_renorm",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Renormalize class weights to mean 1 after applying overrides.",
+        default=False,
+        help="Renormalize class weights to mean 1 after applying per-class multipliers.",
+    )
+    parser.add_argument(
+        "--assign_topk",
+        type=int,
+        default=10,
+        help="Default TaskAligned assignment top_k for each class.",
+    )
+    parser.add_argument(
+        "--class_topk_overrides",
+        default=DEFAULT_CLASS_TOPK_OVERRIDES,
+        help="Comma-separated per-class assignment top_k overrides, e.g. chair=6,car=12.",
     )
     parser.add_argument(
         "--quality_targets",
@@ -572,6 +618,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--neck_depth must be >= 1")
     if args.head_depth < 1:
         raise ValueError("--head_depth must be >= 1")
+    if args.assign_topk <= 0:
+        raise ValueError("--assign_topk must be > 0")
     if args.positive_empty_weight < 0:
         raise ValueError("--positive_empty_weight must be >= 0")
     if args.positive_focus_class_boost <= 0:
@@ -584,6 +632,7 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--quality_target_floor must be in [0, 1]")
     args.positive_focus_classes = parse_class_list(args.positive_focus_classes)
     args.class_weight_overrides = parse_class_weight_overrides(args.class_weight_overrides)
+    args.class_topk_overrides = parse_class_topk_overrides(args.class_topk_overrides)
     return args
 
 
@@ -714,14 +763,25 @@ def train_single_run(
         overrides=args.class_weight_overrides,
         renormalize=args.class_weight_renorm,
     )
+    class_topk = build_class_topk(
+        classes=classes,
+        default_topk=args.assign_topk,
+        overrides=args.class_topk_overrides,
+    )
     logger.info("Train class counts: %s", json.dumps(class_counts, ensure_ascii=False, sort_keys=True))
     logger.info(
-        "Class weighting: enabled=%s scheme=sqrt_inverse overrides=%s renorm=%s base_weights=%s weights=%s",
+        "Class weighting: enabled=%s scheme=sqrt_inverse multipliers=%s renorm=%s base_weights=%s weights=%s",
         args.class_weighting,
         json.dumps(args.class_weight_overrides, ensure_ascii=False, sort_keys=True),
         args.class_weight_renorm,
         json.dumps({class_name: round(float(weight), 6) for class_name, weight in zip(classes, base_class_weights)}),
         json.dumps({class_name: round(float(weight), 6) for class_name, weight in zip(classes, class_weights)}),
+    )
+    logger.info(
+        "Assignment top_k: default=%d overrides=%s per_class=%s",
+        args.assign_topk,
+        json.dumps(args.class_topk_overrides, ensure_ascii=False, sort_keys=True),
+        json.dumps({class_name: int(topk) for class_name, topk in zip(classes, class_topk)}),
     )
     logger.info(
         "Mosaic: enabled=%s p=%.3f equalizers_apply_only_to_non_mosaic_samples=true",
@@ -732,6 +792,8 @@ def train_single_run(
         num_classes=len(classes),
         strides=model.head.strides,
         reg_max=model.head.reg_max,
+        topk=args.assign_topk,
+        topk_by_class=class_topk,
         class_weights=class_weights,
         quality_targets=args.quality_targets,
         quality_target_floor=args.quality_target_floor,

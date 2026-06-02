@@ -74,6 +74,7 @@ class YOLOv8Loss(nn.Module):
         cls_gain: float = 0.5,
         dfl_gain: float = 1.5,
         class_weights: torch.Tensor | list[float] | None = None,
+        topk_by_class: torch.Tensor | list[int] | None = None,
         quality_targets: bool = True,
         quality_target_floor: float = 0.05,
     ):
@@ -96,6 +97,15 @@ class YOLOv8Loss(nn.Module):
             if weights.numel() != num_classes:
                 raise ValueError(f"Expected {num_classes} class weights, got {weights.numel()}")
         self.register_buffer("class_weights", weights.view(1, 1, num_classes))
+        if topk_by_class is None:
+            topk_values = torch.full((num_classes,), int(topk), dtype=torch.long)
+        else:
+            topk_values = torch.as_tensor(topk_by_class, dtype=torch.long)
+            if topk_values.numel() != num_classes:
+                raise ValueError(f"Expected {num_classes} class top_k values, got {topk_values.numel()}")
+            if (topk_values <= 0).any():
+                raise ValueError("class top_k values must be > 0")
+        self.register_buffer("topk_by_class", topk_values.view(num_classes))
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
 
     def forward(self, outputs: dict, targets: list[dict]) -> YOLOv8LossItems:
@@ -205,7 +215,8 @@ class YOLOv8Loss(nn.Module):
                     pos_idx = nearest.view(1)
                 else:
                     candidate = torch.where(pos)[0]
-                    k = min(self.topk, candidate.numel())
+                    class_topk = int(self.topk_by_class[gt_labels[gt_idx]].item())
+                    k = min(class_topk, candidate.numel())
                     pos_idx = candidate[metric[candidate].topk(k).indices]
 
                 better = metrics[pos_idx, gt_idx] >= assigned_metric[pos_idx]
