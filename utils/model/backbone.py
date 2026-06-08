@@ -12,7 +12,7 @@ class YOLOv8Backbone(nn.Module):
         super().__init__()
         self.use_p2 = use_p2
 
-        self.stem = Conv(3, 32, k = 3, s =2) #320 -> 160
+        self.stem = Conv(3, 32, k = 3, s =2) # 320 -> 160
 
         self.stage1 = nn.Sequential(
             Conv(32, 64, k = 3, s =2),           # 160 -> 80
@@ -52,10 +52,10 @@ class YOLOv8Backbone(nn.Module):
 
 class ConvNeXtV2TinyBackbone(nn.Module):
     """
-    ImageNet-pretrained ConvNeXt V2 Tiny feature extractor with the same
-    output contract as the YOLOv8 neck:
-      - P2/P3/P4/P5 at strides 4/8/16/32 and channels 64/128/256/512, or
-      - P3/P4/P5 at strides 8/16/32 and channels 128/256/512.
+    Feature extractor ConvNeXt V2 Tiny pretrained ImageNet.
+    Output khớp YOLOv8 neck:
+      - P2/P3/P4/P5 stride 4/8/16/32, channel 64/128/256/512, hoặc
+      - P3/P4/P5 stride 8/16/32, channel 128/256/512.
     """
 
     def __init__(
@@ -67,7 +67,7 @@ class ConvNeXtV2TinyBackbone(nn.Module):
     ):
         super().__init__()
         if timm is None:
-            raise ImportError("timm is required for ConvNeXtV2TinyBackbone. Install it with: python3 -m pip install timm")
+            raise ImportError("Cần timm cho ConvNeXtV2TinyBackbone. Cài bằng: python3 -m pip install timm")
 
         self.use_p2 = use_p2
         out_indices = (0, 1, 2, 3) if use_p2 else (1, 2, 3)
@@ -84,7 +84,7 @@ class ConvNeXtV2TinyBackbone(nn.Module):
         in_channels = self.features.feature_info.channels()
         reductions = self.features.feature_info.reduction()
         if tuple(reductions) != expected_reductions:
-            raise ValueError(f"{model_name} returned reductions {reductions}, expected {expected_reductions}.")
+            raise ValueError(f"{model_name} trả về reductions {reductions}, cần {expected_reductions}.")
 
         self.adapters = nn.ModuleList(
             Conv(c1, c2, k=1, s=1) for c1, c2 in zip(in_channels, out_channels)

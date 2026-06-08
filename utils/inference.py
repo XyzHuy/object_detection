@@ -95,7 +95,7 @@ def load_class_thresholds(spec: str | Path | None, classes: list[str]) -> dict[s
                 continue
             if "=" not in item:
                 raise ValueError(
-                    "--class_thresholds must be a JSON file or comma-separated class=value pairs"
+                    "--class_thresholds phải là file JSON hoặc chuỗi class=value cách nhau bằng dấu phẩy"
                 )
             class_name, value = item.split("=", 1)
             data[class_name.strip()] = float(value)
@@ -106,21 +106,21 @@ def load_class_thresholds(spec: str | Path | None, classes: list[str]) -> dict[s
     if isinstance(data, list):
         if len(data) != len(classes):
             raise ValueError(
-                f"Threshold list length {len(data)} does not match {len(classes)} classes"
+                f"Danh sách ngưỡng dài {len(data)} không khớp {len(classes)} class"
             )
         data = dict(zip(classes, data))
 
     if not isinstance(data, dict):
-        raise ValueError("Class thresholds must be a dict, a list, or a dict with a 'thresholds' field")
+        raise ValueError("Ngưỡng theo class phải là dict, list, hoặc dict có field 'thresholds'")
 
     class_set = set(classes)
     thresholds = {}
     for class_name, value in data.items():
         if class_name not in class_set:
-            raise ValueError(f"Unknown class in thresholds: {class_name}")
+            raise ValueError(f"Class không tồn tại trong ngưỡng: {class_name}")
         threshold = float(value)
         if threshold < 0 or threshold > 1:
-            raise ValueError(f"Invalid threshold for {class_name}: {threshold}")
+            raise ValueError(f"Ngưỡng không hợp lệ cho {class_name}: {threshold}")
         thresholds[class_name] = threshold
     return thresholds
 
@@ -163,7 +163,7 @@ def predict_image(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Run YOLOv8 inference and write public predictions JSON")
+    parser = argparse.ArgumentParser("Chạy suy luận YOLOv8 và ghi JSON dự đoán")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--source", default="final_public/public/val/images")
     parser.add_argument("--output", default="predictions.json")
@@ -173,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf_threshold", type=float, default=0.001)
     parser.add_argument(
         "--class_thresholds",
-        help="JSON file or comma-separated class=value pairs. Keep --conf_threshold <= the minimum class threshold.",
+        help="File JSON hoặc chuỗi class=value cách nhau bằng dấu phẩy. Giữ --conf_threshold <= ngưỡng class nhỏ nhất.",
     )
     parser.add_argument("--nms_iou", type=float, default=0.65)
     parser.add_argument("--max_det", type=int, default=100)
@@ -212,7 +212,7 @@ def main() -> None:
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(predictions, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"wrote {len(predictions)} predictions to {output_path}")
+    print(f"Đã ghi {len(predictions)} dự đoán vào {output_path}")
 
 
 if __name__ == "__main__":

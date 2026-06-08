@@ -11,7 +11,7 @@ class YOLOv8Neck(nn.Module):
         c2f_depth = max(int(c2f_depth), 1)
 
 
-        #top down
+        # Nhánh top-down
         self.reduce_p5 = Conv(512, 256, k =1 , s = 1)
         self.c2f_p4 = C2f(256 + 256, 256, n=c2f_depth)
 
@@ -22,7 +22,7 @@ class YOLOv8Neck(nn.Module):
             self.reduce_p3 = Conv(128, 64, k=1, s=1)
             self.c2f_p2 = C2f(64 + 64, 64, n=c2f_depth)
 
-        #bottom up
+        # Nhánh bottom-up
         if self.use_p2:
             self.down_p2 = Conv(64, 64, k=3, s=2)
             self.c2f_n3 = C2f(64 + 128, 128, n=c2f_depth)
@@ -41,7 +41,7 @@ class YOLOv8Neck(nn.Module):
         else:
             p3, p4, p5 = features
 
-        # top-down path
+        # Đường top-down
         p5_reduced = self.reduce_p5(p5)
         p5_up = F.interpolate(p5_reduced, scale_factor=2, mode="nearest")
 
@@ -74,7 +74,7 @@ class YOLOv8Neck(nn.Module):
 
             return p2_out, n3, n4, n5
 
-        # bottom-up path
+        # Đường bottom-up
         n4 = self.down_p3(p3_out)
         n4 = torch.cat([n4, p4_out], dim=1)
         n4 = self.c2f_n4(n4)

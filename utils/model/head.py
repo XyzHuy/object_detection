@@ -8,7 +8,7 @@ from .common import Conv
 
 class DFL(nn.Module):
     """
-    Distribution Focal Layer.
+    Lớp Distribution Focal.
 
     Input:
         x: [B, 4 * reg_max, N]
@@ -24,11 +24,11 @@ class DFL(nn.Module):
         super().__init__()
         self.reg_max = reg_max
 
-        self.proj = nn.Conv2d(reg_max, 1, kernel_size = 1, bias = False) # yêu cầu có shape [B*4, reg_max, N, 1]
+        self.proj = nn.Conv2d(reg_max, 1, kernel_size = 1, bias = False) # Cần shape [B*4, reg_max, N, 1]
 
         self.proj.weight.data[:] = torch.arange(
             reg_max, dtype = torch.float
-        ).view(1, reg_max, 1, 1) # chuyển trọng số thành [0, 1, 2, ..., reg_max-1] để khi nhân với xác suất sẽ ra expected value
+        ).view(1, reg_max, 1, 1) # Trọng số bin để tính kỳ vọng
 
         for p in self.proj.parameters():
             p.requires_grad = False
@@ -38,7 +38,7 @@ class DFL(nn.Module):
         b,c,n = x.shape # [B, 4*reg_max, N]
         x = x.view(b,4,self.reg_max, n) # [B, 4, reg_max, N]
 
-        x= x.softmax(dim = 2) # [B, 4, reg_max, N] (softmax trên dim reg_max để ra xác suất)
+        x= x.softmax(dim = 2) # Softmax trên dim reg_max
         x = x.permute(0, 1, 3, 2).contiguous() # [B, 4, N, reg_max]
         x = x.view(b * 4, n, self.reg_max)# [B*4, N, reg_max]
         x = x.permute(0, 2, 1).unsqueeze(-1) # [B*4, reg_max, N, 1]
@@ -67,7 +67,7 @@ def make_anchors(features, strides, offset = 0.5):
     strides:
         ví dụ [8, 16, 32]
 
-    Return:
+    Trả về:
         anchor_points: [N, 2]
         stride_tensor: [N, 1]
     """
@@ -105,7 +105,7 @@ def dist2bbox(distance, anchor_points, xywh = False):
     distance: [B, 4, N]
     anchor_points: [N, 2]
 
-    Return:
+    Trả về:
         bbox: [B, 4, N]
     """
     lt, rb = distance[:, 0:2, :], distance[:, 2:4, :]
@@ -126,7 +126,7 @@ def dist2bbox(distance, anchor_points, xywh = False):
 
 class YOLOv8DetectHead(nn.Module):
     """
-    YOLOv8-like Detection Head.
+    Detection head kiểu YOLOv8.
 
     Input:
         features = [P3, P4, P5]
@@ -135,13 +135,13 @@ class YOLOv8DetectHead(nn.Module):
         P4: [B, 256, 20, 20]
         P5: [B, 512, 10, 10]
 
-    Training output:
+    Output khi train:
         dict:
             boxes_raw: [B, 4 * reg_max, N]
             cls_logits: [B, num_classes, N]
-            feats: original feature maps
+            feats: feature maps gốc
 
-    Inference output:
+    Output khi inference:
         pred: [B, 4 + num_classes, N]
              bbox đã decode + class probability
     """
@@ -163,14 +163,14 @@ class YOLOv8DetectHead(nn.Module):
         self.strides = strides
         head_depth = max(int(head_depth), 1)
 
-        # Box regression branch
+        # Nhánh box regression
         self.box_heads = nn.ModuleList()
 
-        # Classification branch
+        # Nhánh classification
         self.cls_heads = nn.ModuleList()
 
         for c in channels:
-            # box branch output = 4 * reg_max
+            # Output nhánh box = 4 * reg_max
             box_hidden = max(16, c // 4, 4 * reg_max)
 
             self.box_heads.append(
@@ -183,7 +183,7 @@ class YOLOv8DetectHead(nn.Module):
                 )
             )
 
-            # cls branch output = num_classes
+            # Output nhánh cls = num_classes
             cls_hidden = max(c, min(num_classes, 100))
 
             self.cls_heads.append(
@@ -208,7 +208,7 @@ class YOLOv8DetectHead(nn.Module):
         """
         Convert feature maps thành dạng flatten.
 
-        Return:
+        Trả về:
             box_raw: [B, 4 * reg_max, N]
             cls_logits: [B, num_classes, N]
         """
@@ -246,7 +246,7 @@ class YOLOv8DetectHead(nn.Module):
         cls_logits:
             [B, num_classes, N]
 
-        Return:
+        Trả về:
             pred: [B, 4 + num_classes, N]
         """
 
@@ -258,14 +258,14 @@ class YOLOv8DetectHead(nn.Module):
         # [B, 4 * reg_max, N] -> [B, 4, N]
         pred_dist = self.dfl(box_raw)
 
-        # Decode trên feature map coordinate
+        # Decode theo tọa độ feature map
         pred_boxes = dist2bbox(
             pred_dist,
             anchor_points,
             xywh=xywh,
         )
 
-        # Convert từ feature map coordinate về image pixel coordinate
+        # Đổi về tọa độ pixel ảnh
         # stride_tensor: [N, 1] -> [1, 1, N]
         stride_tensor = stride_tensor.T.unsqueeze(0)
         pred_boxes = pred_boxes * stride_tensor

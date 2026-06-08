@@ -1,13 +1,11 @@
 import os
 import json
-import math
 import random
 import torch
 import numpy as np
 from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.data import Sampler, WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from typing import Optional, Callable, List, Tuple, Dict
 import torchvision.transforms.functional as trans_func
@@ -33,10 +31,10 @@ def letterbox_resize(image: Image.Image, target_size: int, target: dict) -> Tupl
     W_new = int(round(W_orig * scale))
     H_new = int(round(H_orig * scale))
 
-    # Resize giữ aspect ratio
+    # Resize giữ tỉ lệ
     image = image.resize((W_new, H_new), Image.BILINEAR)
 
-    # Padding offset để căn giữa
+    # Padding để căn giữa
     pad_left = (target_size - W_new) // 2
     pad_top  = (target_size - H_new) // 2
 
@@ -44,12 +42,12 @@ def letterbox_resize(image: Image.Image, target_size: int, target: dict) -> Tupl
     canvas = Image.new("RGB", (target_size, target_size), (114, 114, 114))
     canvas.paste(image, (pad_left, pad_top))
 
-    # Scale + shift bounding boxes
+    # Scale và dịch bbox
     if target["boxes"].numel() > 0:
         boxes = target["boxes"].clone().float()
         boxes[:, [0, 2]] = boxes[:, [0, 2]] * scale + pad_left  # x1, x2
         boxes[:, [1, 3]] = boxes[:, [1, 3]] * scale + pad_top   # y1, y2
-        # Clamp vào trong ảnh
+        # Giới hạn trong ảnh
         boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, target_size)
         boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, target_size)
         target["boxes"] = boxes
@@ -84,7 +82,7 @@ def bucket_bounds(bucket_name: str) -> Tuple[float, float]:
     for name, lower, upper in AREA_BUCKETS:
         if name == bucket_name:
             return lower, upper
-    raise KeyError(f"Unknown area bucket: {bucket_name}")
+    raise KeyError(f"Bucket diện tích không tồn tại: {bucket_name}")
 
 
 SHAPE_BUCKETS = (
@@ -107,14 +105,13 @@ def shape_bucket_bounds(bucket_name: str) -> Tuple[float, float]:
     for name, lower, upper in SHAPE_BUCKETS:
         if name == bucket_name:
             return lower, upper
-    raise KeyError(f"Unknown shape bucket: {bucket_name}")
+    raise KeyError(f"Bucket dáng bbox không tồn tại: {bucket_name}")
 
 
 class BoxTypeEqualizer:
     """
-    Scale whole letterboxed images to synthesize under-represented box-size buckets
-    within each class. Down-scaling creates more small/tiny boxes; up-scaling creates
-    more medium/large boxes while cropping around the selected object.
+    Scale ảnh letterbox để bù bucket kích thước bbox thiếu theo class.
+    Downscale tạo bbox nhỏ; upscale tạo bbox lớn quanh object được chọn.
     """
 
     def __init__(
@@ -123,7 +120,6 @@ class BoxTypeEqualizer:
         images: List[Dict],
         ann_by_image_id: Dict[str, List[Dict]],
         img_size: int,
-        p: float = 0.5,
         max_downscale: float = 0.55,
         max_upscale: float = 1.8,
         min_visibility: float = 0.25,
@@ -131,7 +127,6 @@ class BoxTypeEqualizer:
     ):
         self.classes = classes
         self.img_size = img_size
-        self.p = p
         self.max_downscale = max_downscale
         self.max_upscale = max_upscale
         self.min_visibility = min_visibility
@@ -251,32 +246,56 @@ class BoxTypeEqualizer:
             for class_idx in range(len(self.classes))
         }
 
-    def __call__(self, image: Image.Image, target: dict) -> Tuple[Image.Image, dict]:
-        if random.random() > self.p or target["boxes"].numel() == 0:
+    def __call__(
+        self,
+        image: Image.Image,
+        target: dict,
+        focus_class_idx: Optional[int] = None,
+        target_bucket: Optional[str] = None,
+    ) -> Tuple[Image.Image, dict]:
+        if target["boxes"].numel() == 0:
             return image, target
 
-        candidate = self._sample_candidate(target["boxes"], target["labels"])
+        candidate = self._sample_candidate(
+            target["boxes"],
+            target["labels"],
+            focus_class_idx=focus_class_idx,
+            target_bucket=target_bucket,
+        )
         if candidate is None:
             return image, target
 
         box_idx, scale = candidate
         return self._scale_image_and_boxes(image, target, box_idx, scale)
 
-    def _sample_candidate(self, boxes: torch.Tensor, labels: torch.Tensor) -> Optional[Tuple[int, float]]:
+    def _sample_candidate(
+        self,
+        boxes: torch.Tensor,
+        labels: torch.Tensor,
+        focus_class_idx: Optional[int] = None,
+        target_bucket: Optional[str] = None,
+    ) -> Optional[Tuple[int, float]]:
         image_area = float(self.img_size * self.img_size)
         candidates = []
         weights = []
 
         for box_idx, (box, label) in enumerate(zip(boxes, labels)):
             class_idx = int(label)
+            if focus_class_idx is not None and class_idx != focus_class_idx:
+                continue
             current_area = max(float((box[2] - box[0]) * (box[3] - box[1])), 1.0) / image_area
             current_bucket = area_bucket(current_area)
             deficits = self.class_bucket_deficits.get(class_idx, {})
 
-            for target_bucket, deficit in deficits.items():
-                if deficit <= 0 or target_bucket == current_bucket:
+            bucket_items = (
+                [(target_bucket, deficits.get(target_bucket, 0))]
+                if target_bucket is not None
+                else deficits.items()
+            )
+            for bucket_name, deficit in bucket_items:
+                if deficit <= 0 or bucket_name == current_bucket:
                     continue
-                scale_range = self._scale_range_for_bucket(class_idx, current_area, target_bucket)
+                scale_range = self._scale_range_for_bucket(class_idx, current_area, bucket_name)
                 if scale_range is None:
                     continue
                 candidates.append((box_idx, scale_range))
@@ -381,7 +400,6 @@ class BoxShapeEqualizer:
         classes: List[str],
         ann_by_image_id: Dict[str, List[Dict]],
         img_size: int,
-        p: float = 0.5,
         max_axis_scale: float = 1.6,
         min_axis_scale: float = 0.65,
         min_visibility: float = 0.25,
@@ -389,7 +407,6 @@ class BoxShapeEqualizer:
     ):
         self.classes = classes
         self.img_size = img_size
-        self.p = p
         self.max_axis_scale = max_axis_scale
         self.min_axis_scale = min_axis_scale
         self.min_visibility = min_visibility
@@ -505,18 +522,35 @@ class BoxShapeEqualizer:
             for class_idx in range(len(self.classes))
         }
 
-    def __call__(self, image: Image.Image, target: dict) -> Tuple[Image.Image, dict]:
-        if random.random() > self.p or target["boxes"].numel() == 0:
+    def __call__(
+        self,
+        image: Image.Image,
+        target: dict,
+        focus_class_idx: Optional[int] = None,
+        target_bucket: Optional[str] = None,
+    ) -> Tuple[Image.Image, dict]:
+        if target["boxes"].numel() == 0:
             return image, target
 
-        candidate = self._sample_candidate(target["boxes"], target["labels"])
+        candidate = self._sample_candidate(
+            target["boxes"],
+            target["labels"],
+            focus_class_idx=focus_class_idx,
+            target_bucket=target_bucket,
+        )
         if candidate is None:
             return image, target
 
         box_idx, scale_x, scale_y = candidate
         return self._anisotropic_scale_image_and_boxes(image, target, box_idx, scale_x, scale_y)
 
-    def _sample_candidate(self, boxes: torch.Tensor, labels: torch.Tensor) -> Optional[Tuple[int, float, float]]:
+    def _sample_candidate(
+        self,
+        boxes: torch.Tensor,
+        labels: torch.Tensor,
+        focus_class_idx: Optional[int] = None,
+        target_bucket: Optional[str] = None,
+    ) -> Optional[Tuple[int, float, float]]:
         candidates = []
         weights = []
 
@@ -526,12 +560,19 @@ class BoxShapeEqualizer:
             current_aspect = width / height
             current_bucket = shape_bucket(current_aspect)
             class_idx = int(label)
+            if focus_class_idx is not None and class_idx != focus_class_idx:
+                continue
             deficits = self.class_bucket_deficits.get(class_idx, {})
 
-            for target_bucket, deficit in deficits.items():
-                if deficit <= 0 or target_bucket == current_bucket:
+            bucket_items = (
+                [(target_bucket, deficits.get(target_bucket, 0))]
+                if target_bucket is not None
+                else deficits.items()
+            )
+            for bucket_name, deficit in bucket_items:
+                if deficit <= 0 or bucket_name == current_bucket:
                     continue
-                scale_pair = self._axis_scales_for_bucket(class_idx, current_aspect, target_bucket)
+                scale_pair = self._axis_scales_for_bucket(class_idx, current_aspect, bucket_name)
                 if scale_pair is None:
                     continue
                 candidates.append((box_idx, scale_pair[0], scale_pair[1]))
@@ -637,24 +678,19 @@ class MosaicAugmentation:
     def __init__(
         self,
         img_size: int,
-        p: float = 0.5,
         min_visibility: float = 0.10,
         min_box_size: float = 2.0,
         fill: Tuple[int, int, int] = (114, 114, 114),
     ):
         self.img_size = img_size
-        self.p = p
         self.min_visibility = min_visibility
         self.min_box_size = min_box_size
         self.fill = fill
 
-    def should_apply(self) -> bool:
-        return random.random() < self.p
-
     def __call__(self, dataset: "CustomDataset", idx: int) -> Tuple[Image.Image, dict]:
         size = self.img_size
         base_image_id = dataset.images[idx]["id"]
-        indices = [idx] + random.choices(range(len(dataset)), k=3)
+        indices = [idx] + random.choices(range(dataset.num_base_images), k=3)
         random.shuffle(indices)
         center_x = int(random.uniform(size * 0.25, size * 0.75))
         center_y = int(random.uniform(size * 0.25, size * 0.75))
@@ -794,30 +830,34 @@ class CustomDataset(Dataset):
         split: str = "train",
         transforms: Optional[Callable] = None,
         normalize: bool = True,
-        img_size: int = 512,         # target size cho letterbox
+        img_size: int = 512,         # Kích thước letterbox
         box_type_equalizer: bool = False,
-        box_type_equalizer_p: float = 0.5,
         box_shape_equalizer: bool = False,
-        box_shape_equalizer_p: float = 0.5,
+        box_equalizer_oversample: Optional[Dict[str, float]] = None,
         mosaic: bool = False,
-        mosaic_p: float = 0.5,
+        mosaic_oversample: float = 0.0,
+        seed: Optional[int] = None,
     ):
         self.data_root = Path(data_root)
         self.split = split
         self.transforms = transforms
         self.normalize = normalize
         self.img_size = img_size
+        self.seed = int(seed or 0)
+        self.epoch = 0
+        self.box_equalizer_oversample = dict(box_equalizer_oversample or {})
+        self.mosaic_oversample = float(mosaic_oversample)
         self.box_type_equalizer = None
         self.box_shape_equalizer = None
         self.mosaic = (
-            MosaicAugmentation(img_size=self.img_size, p=mosaic_p)
+            MosaicAugmentation(img_size=self.img_size)
             if mosaic and split == "train"
             else None
         )
 
         annotation_path = self.data_root / "annotations" / f"{self.split}.json"
         if not annotation_path.exists():
-            raise FileNotFoundError(f"Annotation file {annotation_path} not found.")
+            raise FileNotFoundError(f"Không tìm thấy file annotation: {annotation_path}")
 
         with open(annotation_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -825,6 +865,7 @@ class CustomDataset(Dataset):
         self.classes: List[str] = data["classes"]
         self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.classes)}
         self.images: List[Dict] = data["images"]
+        self.num_base_images = len(self.images)
 
         self.ann_by_image_id: Dict[str, List[Dict]] = {}
         for ann in data["annotations"]:
@@ -837,99 +878,190 @@ class CustomDataset(Dataset):
                 images=self.images,
                 ann_by_image_id=self.ann_by_image_id,
                 img_size=self.img_size,
-                p=box_type_equalizer_p,
             )
         if box_shape_equalizer and split == "train":
             self.box_shape_equalizer = BoxShapeEqualizer(
                 classes=self.classes,
                 ann_by_image_id=self.ann_by_image_id,
                 img_size=self.img_size,
-                p=box_shape_equalizer_p,
             )
 
+        self.sample_plan = self._build_sample_plan()
+        self.sample_plan_stats = self._sample_plan_stats()
         self._normalize = trans.Normalize(mean=[0.485, 0.456, 0.406],
                                           std=[0.229, 0.224, 0.225])
-        self.positive_sampling_stats = None
 
     def __len__(self):
-        return len(self.images)
+        return len(self.sample_plan)
 
-    def positive_sampling_weights(
+    def _image_indices_by_class(self) -> Dict[int, List[int]]:
+        image_indices = {class_idx: [] for class_idx in range(len(self.classes))}
+        for image_idx, image_info in enumerate(self.images):
+            present = set()
+            for ann in self.ann_by_image_id.get(image_info["id"], []):
+                class_idx = self.class_to_idx.get(ann["class"])
+                if class_idx is not None:
+                    present.add(class_idx)
+            for class_idx in sorted(present):
+                image_indices[class_idx].append(image_idx)
+        return image_indices
+
+    def _equalizer_source_indices(
         self,
-        focus_classes: Optional[List[str]] = None,
-        empty_weight: float = 0.2,
-        focus_class_boost: float = 1.5,
-        tiny_box_boost: float = 1.8,
-        small_box_boost: float = 1.3,
-    ) -> torch.Tensor:
-        focus_set = set(focus_classes or [])
-        counts_by_class = {class_name: 0 for class_name in self.classes}
-        for anns in self.ann_by_image_id.values():
-            for ann in anns:
-                class_name = ann["class"]
-                if class_name in counts_by_class:
-                    counts_by_class[class_name] += 1
-
-        max_count = max(counts_by_class.values()) if counts_by_class else 1
-        class_weights = {
-            class_name: (max_count / max(count, 1)) ** 0.5
-            for class_name, count in counts_by_class.items()
+        mode: str,
+        deficits_by_class: Dict[int, Dict[str, int]],
+    ) -> Dict[int, Dict[str, List[int]]]:
+        image_idx_by_id = {image_info["id"]: image_idx for image_idx, image_info in enumerate(self.images)}
+        image_by_id = {image_info["id"]: image_info for image_info in self.images}
+        sources = {
+            class_idx: {bucket: set() for bucket in deficits_by_class.get(class_idx, {})}
+            for class_idx in range(len(self.classes))
         }
 
-        weights = []
-        empty_images = 0
-        for image_info in self.images:
-            anns = self.ann_by_image_id.get(image_info["id"], [])
-            if not anns:
-                empty_images += 1
-                weights.append(float(empty_weight))
+        for image_id, anns in self.ann_by_image_id.items():
+            image_idx = image_idx_by_id.get(image_id)
+            if image_idx is None:
                 continue
+            image_info = image_by_id.get(image_id)
+            if image_info is None:
+                continue
+            scale = self.img_size / max(float(image_info["width"]), float(image_info["height"]), 1.0)
+            canvas_area = float(self.img_size * self.img_size)
 
-            image_area = max(float(image_info["width"] * image_info["height"]), 1.0)
-            contributions = []
             for ann in anns:
-                class_name = ann["class"]
+                class_idx = self.class_to_idx.get(ann["class"])
+                if class_idx is None:
+                    continue
                 x1, y1, x2, y2 = ann["bbox"]
-                box_area_ratio = max(float(x2 - x1), 0.0) * max(float(y2 - y1), 0.0) / image_area
-                contribution = class_weights.get(class_name, 1.0)
-                if class_name in focus_set:
-                    contribution *= focus_class_boost
-                if box_area_ratio < 0.01:
-                    contribution *= tiny_box_boost
-                elif box_area_ratio < 0.05:
-                    contribution *= small_box_boost
-                contributions.append(contribution)
+                width = max(float(x2 - x1), 0.0)
+                height = max(float(y2 - y1), 0.0)
+                if width <= 0 or height <= 0:
+                    continue
+                if mode == "box_type":
+                    current_value = area_bucket((width * height * scale * scale) / canvas_area)
+                else:
+                    current_value = shape_bucket(width / height)
 
-            weights.append(float(1.0 + max(contributions) + 0.25 * sum(contributions) / len(contributions)))
+                for target_bucket, deficit in deficits_by_class.get(class_idx, {}).items():
+                    if deficit > 0 and target_bucket != current_value:
+                        sources[class_idx][target_bucket].add(image_idx)
 
-        weights_tensor = torch.tensor(weights, dtype=torch.double).clamp(min=1e-6)
-        self.positive_sampling_stats = {
-            "empty_images": empty_images,
-            "empty_weight": empty_weight,
-            "focus_classes": sorted(focus_set),
-            "focus_class_boost": focus_class_boost,
-            "tiny_box_boost": tiny_box_boost,
-            "small_box_boost": small_box_boost,
-            "class_counts": counts_by_class,
-            "class_weights": {
-                class_name: round(float(weight), 6)
-                for class_name, weight in class_weights.items()
-            },
-            "image_weight_min": round(float(weights_tensor.min()), 6),
-            "image_weight_mean": round(float(weights_tensor.mean()), 6),
-            "image_weight_max": round(float(weights_tensor.max()), 6),
+        return {
+            class_idx: {
+                bucket: sorted(indices)
+                for bucket, indices in bucket_sources.items()
+            }
+            for class_idx, bucket_sources in sources.items()
         }
-        return weights_tensor
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+        if self.split == "train":
+            self.sample_plan = self._build_sample_plan()
+            self.sample_plan_stats = self._sample_plan_stats()
+
+    def _plan_rng(self) -> random.Random:
+        return random.Random(self.seed + self.epoch * 1_000_003)
+
+    def _build_sample_plan(self) -> List[Tuple[str, int, Optional[int], Optional[str]]]:
+        plan = [("base", image_idx, None, None) for image_idx in range(self.num_base_images)]
+        if self.split != "train":
+            return plan
+
+        rng = self._plan_rng()
+        image_indices_by_class = self._image_indices_by_class()
+
+        if self.box_type_equalizer is not None:
+            self._extend_equalizer_plan(
+                plan=plan,
+                mode="box_type",
+                deficits_by_class=self.box_type_equalizer.class_bucket_deficits,
+                image_indices_by_class=image_indices_by_class,
+                source_indices_by_bucket=self._equalizer_source_indices(
+                    "box_type",
+                    self.box_type_equalizer.class_bucket_deficits,
+                ),
+                rng=rng,
+            )
+        if self.box_shape_equalizer is not None:
+            self._extend_equalizer_plan(
+                plan=plan,
+                mode="box_shape",
+                deficits_by_class=self.box_shape_equalizer.class_bucket_deficits,
+                image_indices_by_class=image_indices_by_class,
+                source_indices_by_bucket=self._equalizer_source_indices(
+                    "box_shape",
+                    self.box_shape_equalizer.class_bucket_deficits,
+                ),
+                rng=rng,
+            )
+
+        if self.mosaic is not None and self.mosaic_oversample > 0:
+            num_mosaic = int(round(self.num_base_images * self.mosaic_oversample))
+            for _ in range(num_mosaic):
+                plan.append(("mosaic", rng.randrange(self.num_base_images), None, None))
+
+        return plan
+
+    def _extend_equalizer_plan(
+        self,
+        plan: List[Tuple[str, int, Optional[int], Optional[str]]],
+        mode: str,
+        deficits_by_class: Dict[int, Dict[str, int]],
+        image_indices_by_class: Dict[int, List[int]],
+        source_indices_by_bucket: Dict[int, Dict[str, List[int]]],
+        rng: random.Random,
+    ) -> None:
+        for class_idx in range(len(self.classes)):
+            class_name = self.classes[class_idx]
+            oversample = float(self.box_equalizer_oversample.get(class_name, 0.0))
+            if oversample <= 0:
+                continue
+            source_indices = image_indices_by_class.get(class_idx, [])
+            if not source_indices:
+                continue
+            for bucket_name, deficit in deficits_by_class.get(class_idx, {}).items():
+                num_extra = int(round(deficit * oversample))
+                bucket_sources = source_indices_by_bucket.get(class_idx, {}).get(bucket_name) or source_indices
+                for _ in range(num_extra):
+                    image_idx = rng.choice(bucket_sources)
+                    plan.append((mode, image_idx, class_idx, bucket_name))
+
+    def _sample_plan_stats(self) -> Dict:
+        by_mode = {}
+        by_class = {class_name: {"box_type": 0, "box_shape": 0} for class_name in self.classes}
+        for mode, _image_idx, class_idx, _bucket in self.sample_plan:
+            by_mode[mode] = by_mode.get(mode, 0) + 1
+            if mode in ("box_type", "box_shape") and class_idx is not None:
+                by_class[self.classes[class_idx]][mode] += 1
+        return {
+            "epoch": self.epoch,
+            "dynamic_by_epoch": self.split == "train",
+            "base_images": self.num_base_images,
+            "dataset_items": len(self.sample_plan),
+            "epoch_multiplier": round(len(self.sample_plan) / max(self.num_base_images, 1), 6),
+            "by_mode": by_mode,
+            "mode_ratios": {
+                mode: round(count / max(len(self.sample_plan), 1), 6)
+                for mode, count in by_mode.items()
+            },
+            "equalizer_oversample": {
+                class_name: round(float(self.box_equalizer_oversample.get(class_name, 0.0)), 6)
+                for class_name in self.classes
+            },
+            "equalizer_items_by_class": by_class,
+            "mosaic_oversample": round(float(self.mosaic_oversample), 6),
+        }
 
     def load_raw_sample(self, idx: int) -> Tuple[Image.Image, dict]:
         img_info = self.images[idx]
         img_id   = img_info["id"]
 
-        # Load ảnh
+        # Đọc ảnh
         img_path = self.data_root / img_info["file_name"]
         img = Image.open(img_path).convert("RGB")
 
-        # Build target
+        # Tạo target
         anns = self.ann_by_image_id.get(img_id, [])
         boxes, labels = [], []
         for ann in anns:
@@ -948,25 +1080,35 @@ class CustomDataset(Dataset):
         return img, target
 
     def __getitem__(self, idx: int):
-        use_mosaic = self.mosaic is not None and self.mosaic.should_apply()
-        if use_mosaic:
-            img, target = self.mosaic(self, idx)
+        mode, image_idx, class_idx, bucket = self.sample_plan[idx]
+        if mode == "mosaic":
+            img, target = self.mosaic(self, image_idx)
         else:
-            img, target = self.load_raw_sample(idx)
+            img, target = self.load_raw_sample(image_idx)
 
-            # Letterbox resize (scale + pad) — trước augmentation
+            # Letterbox resize trước augmentation
             img, target = letterbox_resize(img, self.img_size, target)
 
-            if self.box_type_equalizer is not None:
-                img, target = self.box_type_equalizer(img, target)
-            if self.box_shape_equalizer is not None:
-                img, target = self.box_shape_equalizer(img, target)
+            if mode == "box_type" and self.box_type_equalizer is not None:
+                img, target = self.box_type_equalizer(
+                    img,
+                    target,
+                    focus_class_idx=class_idx,
+                    target_bucket=bucket,
+                )
+            elif mode == "box_shape" and self.box_shape_equalizer is not None:
+                img, target = self.box_shape_equalizer(
+                    img,
+                    target,
+                    focus_class_idx=class_idx,
+                    target_bucket=bucket,
+                )
 
-        # Augmentation (albumentations hoặc custom)
+        # Augmentation
         if self.transforms is not None:
             img, target = self.transforms(img, target)
 
-        # To tensor
+        # Chuyển sang tensor
         img = trans_func.to_tensor(img)           # (3, H, W), float [0,1]
         if self.normalize:
             img = self._normalize(img)
@@ -990,63 +1132,7 @@ def seed_worker(worker_id: int) -> None:
     random.seed(worker_seed)
 
 
-class DistributedWeightedSampler(Sampler[int]):
-    """
-    Weighted replacement sampler split across DDP ranks.
-
-    It mirrors DistributedSampler's rank slicing but draws from a shared
-    weighted multinomial sequence each epoch, so positive-focused sampling
-    still works under torchrun.
-    """
-
-    def __init__(
-        self,
-        weights: torch.Tensor,
-        num_replicas: int,
-        rank: int,
-        replacement: bool = True,
-        seed: int = 0,
-        drop_last: bool = False,
-    ):
-        if num_replicas <= 0:
-            raise ValueError("num_replicas must be positive")
-        if not 0 <= rank < num_replicas:
-            raise ValueError("rank must be in [0, num_replicas)")
-        self.weights = torch.as_tensor(weights, dtype=torch.double)
-        self.num_replicas = num_replicas
-        self.rank = rank
-        self.replacement = replacement
-        self.seed = seed
-        self.drop_last = drop_last
-        self.epoch = 0
-
-        dataset_size = len(self.weights)
-        if self.drop_last and dataset_size % self.num_replicas != 0:
-            self.num_samples = math.ceil((dataset_size - self.num_replicas) / self.num_replicas)
-        else:
-            self.num_samples = math.ceil(dataset_size / self.num_replicas)
-        self.total_size = self.num_samples * self.num_replicas
-
-    def __iter__(self):
-        generator = torch.Generator()
-        generator.manual_seed(self.seed + self.epoch)
-        indices = torch.multinomial(
-            self.weights,
-            self.total_size,
-            replacement=self.replacement,
-            generator=generator,
-        ).tolist()
-        indices = indices[self.rank:self.total_size:self.num_replicas]
-        return iter(indices)
-
-    def __len__(self) -> int:
-        return self.num_samples
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = epoch
-
-
-# Build dataloader
+# Tạo dataloader
 
 
 def build_dataloader(
@@ -1061,17 +1147,10 @@ def build_dataloader(
     img_size: int = 512,
     seed: Optional[int] = None,
     box_type_equalizer: bool = False,
-    box_type_equalizer_p: float = 0.5,
     box_shape_equalizer: bool = False,
-    box_shape_equalizer_p: float = 0.5,
+    box_equalizer_oversample: Optional[Dict[str, float]] = None,
     mosaic: bool = False,
-    mosaic_p: float = 0.5,
-    positive_sampling: bool = False,
-    positive_focus_classes: Optional[List[str]] = None,
-    positive_empty_weight: float = 0.2,
-    positive_focus_class_boost: float = 1.5,
-    positive_tiny_box_boost: float = 1.8,
-    positive_small_box_boost: float = 1.3,
+    mosaic_oversample: float = 0.0,
     distributed: bool = False,
     rank: int = 0,
     world_size: int = 1,
@@ -1084,11 +1163,11 @@ def build_dataloader(
         normalize=normalize,
         img_size=img_size,
         box_type_equalizer=box_type_equalizer,
-        box_type_equalizer_p=box_type_equalizer_p,
         box_shape_equalizer=box_shape_equalizer,
-        box_shape_equalizer_p=box_shape_equalizer_p,
+        box_equalizer_oversample=box_equalizer_oversample,
         mosaic=mosaic,
-        mosaic_p=mosaic_p,
+        mosaic_oversample=mosaic_oversample,
+        seed=seed,
     )
 
     generator = None
@@ -1098,32 +1177,7 @@ def build_dataloader(
 
     sampler = None
     shuffle = (split == "train")
-    if positive_sampling and split == "train":
-        weights = dataset.positive_sampling_weights(
-            focus_classes=positive_focus_classes,
-            empty_weight=positive_empty_weight,
-            focus_class_boost=positive_focus_class_boost,
-            tiny_box_boost=positive_tiny_box_boost,
-            small_box_boost=positive_small_box_boost,
-        )
-        if distributed:
-            sampler = DistributedWeightedSampler(
-                weights=weights,
-                num_replicas=world_size,
-                rank=rank,
-                replacement=True,
-                seed=seed or 0,
-                drop_last=drop_last,
-            )
-        else:
-            sampler = WeightedRandomSampler(
-                weights=weights,
-                num_samples=len(dataset),
-                replacement=True,
-                generator=generator,
-            )
-        shuffle = False
-    elif distributed:
+    if distributed:
         sampler = DistributedSampler(
             dataset,
             num_replicas=world_size,
@@ -1151,13 +1205,13 @@ def build_dataloader(
 
 
 
-# Albumentations augmentation (sau letterbox, bbox đã ở tọa độ mới)
+# Augmentation Albumentations sau letterbox
 
 
 def albumentations_transform():
     if A is None:
         raise ImportError(
-            "albumentations is not installed. Install it or run training with --no_aug."
+            "Chưa cài albumentations. Hãy cài thêm hoặc train với --no_aug."
         )
 
     albu = A.Compose([
@@ -1199,7 +1253,7 @@ def albumentations_transform():
 
 
 
-# Visualize loader (không normalize để dễ hiển thị)
+# Loader visualize
 
 
 def build_visualized_loader(
@@ -1211,8 +1265,9 @@ def build_visualized_loader(
     img_size: int = 512,
     box_type_equalizer: bool = False,
     box_shape_equalizer: bool = False,
+    box_equalizer_oversample: Optional[Dict[str, float]] = None,
     mosaic: bool = False,
-    mosaic_p: float = 0.5,
+    mosaic_oversample: float = 0.0,
 ) -> DataLoader:
     return build_dataloader(
         data_root=data_root,
@@ -1226,6 +1281,7 @@ def build_visualized_loader(
         img_size=img_size,
         box_type_equalizer=box_type_equalizer,
         box_shape_equalizer=box_shape_equalizer,
+        box_equalizer_oversample=box_equalizer_oversample,
         mosaic=mosaic,
-        mosaic_p=mosaic_p,
+        mosaic_oversample=mosaic_oversample,
     )

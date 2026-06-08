@@ -20,9 +20,9 @@ DEFAULT_NMS_IOUS = "0.45,0.50,0.55,0.60,0.65,0.70,0.75"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Tune per-class confidence thresholds for official mAP@0.5 or F1")
-    parser.add_argument("--checkpoint", help="Checkpoint to run when --predictions is not provided.")
-    parser.add_argument("--predictions", help="Existing low-threshold predictions JSON to tune offline.")
+    parser = argparse.ArgumentParser("Tune ngưỡng độ tin cậy theo class cho mAP@0.5 hoặc F1 official")
+    parser.add_argument("--checkpoint", help="Checkpoint để chạy khi không truyền --predictions.")
+    parser.add_argument("--predictions", help="File JSON dự đoán ngưỡng thấp để tune offline.")
     parser.add_argument("--source", default="final_public/public/val/images")
     parser.add_argument("--data_root", default="final_public/public")
     parser.add_argument("--split", default="val")
@@ -30,13 +30,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base_conf", type=float, default=0.001)
     parser.add_argument("--threshold_values", default=DEFAULT_THRESHOLDS)
     parser.add_argument("--nms_iou_values", default=DEFAULT_NMS_IOUS)
-    parser.add_argument("--nms_iou", type=float, default=0.65, help="Label used with --predictions mode.")
-    parser.add_argument("--max_det", type=int, default=100, help="Official evaluator max detections per image.")
+    parser.add_argument("--nms_iou", type=float, default=0.65, help="Nhãn dùng trong mode --predictions.")
+    parser.add_argument("--max_det", type=int, default=100, help="Số bbox tối đa mỗi ảnh của bộ đánh giá official.")
     parser.add_argument(
         "--nms_max_det",
         type=int,
         default=300,
-        help="Detections kept after model NMS before threshold filtering.",
+        help="Số bbox giữ lại sau NMS model trước khi lọc ngưỡng.",
     )
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument(
@@ -44,8 +44,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "Minimum mAP@0.5 to keep while optimizing thresholds. Required for F1 selection metrics; "
-            "optional with --selection_metric map to prefer fewer predictions above this mAP floor."
+            "mAP@0.5 tối thiểu cần giữ khi tối ưu ngưỡng. Bắt buộc với metric F1; "
+            "tùy chọn với --selection_metric map để ưu tiên ít dự đoán hơn trên floor này."
         ),
     )
     parser.add_argument(
@@ -53,8 +53,8 @@ def parse_args() -> argparse.Namespace:
         choices=("map", "macro_f1", "micro_f1", "weighted_f1"),
         default="map",
         help=(
-            "Threshold selection objective. Use macro_f1 for usable inference thresholds while "
-            "keeping mAP above --min_map50."
+            "Mục tiêu chọn ngưỡng. Dùng macro_f1 để có ngưỡng suy luận thực dụng "
+            "trong khi giữ mAP trên --min_map50."
         ),
     )
     parser.add_argument("--official_evaluator", default="utils/official_evaluator/evaluate_predictions.py")
@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save_intermediate",
         action="store_true",
-        help="Also write raw/prediction/threshold JSON files for every NMS IoU candidate.",
+        help="Ghi thêm JSON raw/dự đoán/ngưỡng cho từng ứng viên NMS IoU.",
     )
     return parser.parse_args()
 
@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
 def parse_float_list(text: str) -> list[float]:
     values = sorted({float(item.strip()) for item in text.split(",") if item.strip()})
     if not values:
-        raise ValueError("Expected at least one float value")
+        raise ValueError("Cần ít nhất một giá trị float")
     return values
 
 
@@ -79,7 +79,7 @@ def load_official_module(evaluator_path: str | Path):
     evaluator_path = Path(evaluator_path)
     spec = importlib.util.spec_from_file_location("public_evaluate_predictions", evaluator_path)
     if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load official evaluator from {evaluator_path}")
+        raise ImportError(f"Không tải được bộ đánh giá official từ {evaluator_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -382,7 +382,7 @@ def tune_for_predictions(
 
     if selection_metric != "map":
         if target_map is None:
-            raise ValueError("--min_map50 is required when --selection_metric is an F1 metric")
+            raise ValueError("Cần --min_map50 khi --selection_metric là metric F1")
         for round_idx in range(rounds):
             changed = False
             for class_name in classes:
@@ -441,15 +441,15 @@ def tune_for_predictions(
 def main() -> None:
     args = parse_args()
     if not args.checkpoint and not args.predictions:
-        raise ValueError("Provide either --checkpoint or --predictions")
+        raise ValueError("Cần truyền --checkpoint hoặc --predictions")
     if args.rounds < 1:
-        raise ValueError("--rounds must be >= 1")
+        raise ValueError("--rounds phải >= 1")
     if args.base_conf < 0 or args.base_conf > 1:
-        raise ValueError("--base_conf must be in [0, 1]")
+        raise ValueError("--base_conf phải nằm trong [0, 1]")
     if args.min_map50 is not None and not 0 <= args.min_map50 <= 1:
-        raise ValueError("--min_map50 must be in [0, 1]")
+        raise ValueError("--min_map50 phải nằm trong [0, 1]")
     if args.selection_metric != "map" and args.min_map50 is None:
-        raise ValueError("Provide --min_map50 when using an F1 selection metric")
+        raise ValueError("Cần --min_map50 khi dùng metric chọn theo F1")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -473,7 +473,7 @@ def main() -> None:
         model, checkpoint_data = load_model(args.checkpoint, len(classes), device)
         if checkpoint_data.get("classes") and checkpoint_data["classes"] != classes:
             raise ValueError(
-                f"Checkpoint classes {checkpoint_data['classes']} do not match ground truth classes {classes}"
+                f"Classes trong checkpoint {checkpoint_data['classes']} không khớp ground truth {classes}"
             )
 
     all_results = []
@@ -539,8 +539,8 @@ def main() -> None:
         print(
             f"nms={nms_iou:g} mAP@0.5={metrics['mAP@0.5']:.6f} "
             f"macro_f1={metrics['macro_f1']:.6f} micro_f1={metrics['micro_f1']:.6f} "
-            f"min_f1={metrics['min_class_f1']:.6f} preds={metrics['num_predictions']} "
-            f"thresholds={thresholds}"
+            f"min_f1={metrics['min_class_f1']:.6f} số_dự_đoán={metrics['num_predictions']} "
+            f"ngưỡng={thresholds}"
         )
 
     assert best_result is not None and best_predictions is not None
@@ -568,12 +568,12 @@ def main() -> None:
     write_json(output_dir / "best_score.json", best_score)
 
     print(
-        f"best nms={best_result['nms_iou']:g} mAP@0.5={best_score['mAP@0.5']:.6f} "
+        f"tốt_nhất nms={best_result['nms_iou']:g} mAP@0.5={best_score['mAP@0.5']:.6f} "
         f"macro_f1={best_score['macro_f1']:.6f} micro_f1={best_score['micro_f1']:.6f} "
-        f"min_f1={best_score['min_class_f1']:.6f} preds={best_score['num_predictions']}"
+        f"min_f1={best_score['min_class_f1']:.6f} số_dự_đoán={best_score['num_predictions']}"
     )
-    print(f"wrote {output_dir / 'best_thresholds.json'}")
-    print(f"wrote {output_dir / 'best_predictions.json'}")
+    print(f"Đã ghi {output_dir / 'best_thresholds.json'}")
+    print(f"Đã ghi {output_dir / 'best_predictions.json'}")
 
 
 if __name__ == "__main__":

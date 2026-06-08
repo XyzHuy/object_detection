@@ -95,16 +95,16 @@ class YOLOv8Loss(nn.Module):
         else:
             weights = torch.as_tensor(class_weights, dtype=torch.float32)
             if weights.numel() != num_classes:
-                raise ValueError(f"Expected {num_classes} class weights, got {weights.numel()}")
+                raise ValueError(f"Cần {num_classes} class weights, nhận {weights.numel()}")
         self.register_buffer("class_weights", weights.view(1, 1, num_classes))
         if topk_by_class is None:
             topk_values = torch.full((num_classes,), int(topk), dtype=torch.long)
         else:
             topk_values = torch.as_tensor(topk_by_class, dtype=torch.long)
             if topk_values.numel() != num_classes:
-                raise ValueError(f"Expected {num_classes} class top_k values, got {topk_values.numel()}")
+                raise ValueError(f"Cần {num_classes} giá trị top_k theo class, nhận {topk_values.numel()}")
             if (topk_values <= 0).any():
-                raise ValueError("class top_k values must be > 0")
+                raise ValueError("Giá trị top_k theo class phải > 0")
         self.register_buffer("topk_by_class", topk_values.view(num_classes))
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
 

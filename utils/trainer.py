@@ -26,25 +26,25 @@ from utils.model import YOLOv8Scratch
 
 
 DEFAULT_IMG_SIZE = 768
-DEFAULT_EPOCHS = 80
+DEFAULT_EPOCHS = 35
+DEFAULT_SCHEDULER_EPOCHS = 80
 DEFAULT_BATCH_SIZE = 16
 DEFAULT_LR = 0.00015
 DEFAULT_BACKBONE_LR = 0.000025
 DEFAULT_WEIGHT_DECAY = 1e-4
-DEFAULT_FREEZE_BACKBONE_EPOCHS = 5
-DEFAULT_EARLY_STOP_PATIENCE = 20
+DEFAULT_FREEZE_BACKBONE_EPOCHS = 2
+DEFAULT_EARLY_STOP_PATIENCE = 7
 DEFAULT_MIN_DELTA = 1e-4
-DEFAULT_ALTER_BEST_MIN_MAP = 0.8
 DEFAULT_CONF_THRESHOLD = 0.001
 DEFAULT_NMS_IOU = 0.65
 DEFAULT_MAX_DET = 100
 DEFAULT_SEED = 42
 DEFAULT_NUM_RUNS = 1
 DEFAULT_EMA_DECAY = 0.9999
-DEFAULT_MOSAIC_P = 0.3
+DEFAULT_MOSAIC_OVERSAMPLE = 0.95
+DEFAULT_BOX_EQUALIZER_OVERSAMPLE = "chair=1.0,cat=0.70,dog=0.60,car=0.50,person=0.35"
 DEFAULT_NECK_DEPTH = 2
 DEFAULT_HEAD_DEPTH = 3
-DEFAULT_POSITIVE_FOCUS_CLASSES = "car"
 DEFAULT_CLASS_WEIGHT_OVERRIDES = "chair=1.6"
 DEFAULT_CLASS_TOPK_OVERRIDES = "chair=6"
 DEFAULT_QUALITY_TARGET_FLOOR = 0.05
@@ -126,7 +126,10 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 
 def set_sampler_epoch(loader, epoch: int) -> None:
+    dataset = getattr(loader, "dataset", None)
     sampler = getattr(loader, "sampler", None)
+    if hasattr(dataset, "set_epoch"):
+        dataset.set_epoch(epoch)
     if hasattr(sampler, "set_epoch"):
         sampler.set_epoch(epoch)
 
@@ -135,9 +138,9 @@ def per_device_batch_size(global_batch_size: int, world_size: int) -> int:
     if world_size <= 1:
         return global_batch_size
     if global_batch_size < world_size:
-        raise ValueError("--batch_size must be >= WORLD_SIZE when using DDP")
+        raise ValueError("--batch_size phải >= WORLD_SIZE khi dùng DDP")
     if global_batch_size % world_size != 0:
-        raise ValueError("--batch_size must be divisible by WORLD_SIZE when using DDP")
+        raise ValueError("--batch_size phải chia hết cho WORLD_SIZE khi dùng DDP")
     return global_batch_size // world_size
 
 
@@ -186,20 +189,12 @@ def set_backbone_trainable(model: torch.nn.Module, trainable: bool) -> None:
         backbone.set_feature_extractor_trainable(trainable)
 
 
-def set_seed(seed: int, deterministic: bool = False) -> None:
+def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = False
-    if deterministic:
-        torch.use_deterministic_algorithms(True, warn_only=True)
-
-
-def parse_class_list(text: str | None) -> list[str]:
-    if not text:
-        return []
-    return [item.strip() for item in text.split(",") if item.strip()]
 
 
 def parse_class_weight_overrides(text: str | None) -> dict[str, float]:
@@ -211,13 +206,38 @@ def parse_class_weight_overrides(text: str | None) -> dict[str, float]:
         if not item:
             continue
         if "=" not in item:
-            raise ValueError("--class_weight_overrides items must be class=multiplier")
+            raise ValueError("Mỗi mục --class_weight_overrides phải có dạng class=multiplier")
         class_name, value = item.split("=", 1)
         multiplier = float(value)
         if multiplier <= 0:
-            raise ValueError("--class_weight_overrides multipliers must be > 0")
+            raise ValueError("Multiplier trong --class_weight_overrides phải > 0")
         overrides[class_name.strip()] = multiplier
     return overrides
+
+
+def parse_class_float_overrides(text: str | None, flag_name: str) -> dict[str, float]:
+    if not text:
+        return {}
+    overrides = {}
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Mỗi mục {flag_name} phải có dạng class=value")
+        class_name, value = item.split("=", 1)
+        number = float(value)
+        if number < 0:
+            raise ValueError(f"Giá trị trong {flag_name} phải >= 0")
+        overrides[class_name.strip()] = number
+    return overrides
+
+
+def validate_class_names(values: dict, classes: list[str], flag_name: str) -> None:
+    known = set(classes)
+    unknown = sorted(class_name for class_name in values if class_name not in known)
+    if unknown:
+        raise ValueError(f"Class không tồn tại trong {flag_name}: {', '.join(unknown)}")
 
 
 def parse_class_topk_overrides(text: str | None) -> dict[str, int]:
@@ -229,11 +249,11 @@ def parse_class_topk_overrides(text: str | None) -> dict[str, int]:
         if not item:
             continue
         if "=" not in item:
-            raise ValueError("--class_topk_overrides items must be class=top_k")
+            raise ValueError("Mỗi mục --class_topk_overrides phải có dạng class=top_k")
         class_name, value = item.split("=", 1)
         topk = int(value)
         if topk <= 0:
-            raise ValueError("--class_topk_overrides top_k values must be > 0")
+            raise ValueError("top_k trong --class_topk_overrides phải > 0")
         overrides[class_name.strip()] = topk
     return overrides
 
@@ -244,12 +264,12 @@ def build_class_topk(
     overrides: dict[str, int],
 ) -> torch.Tensor:
     if default_topk <= 0:
-        raise ValueError("--assign_topk must be > 0")
+        raise ValueError("--assign_topk phải > 0")
     topk_by_class = torch.full((len(classes),), int(default_topk), dtype=torch.long)
     class_to_idx = {class_name: idx for idx, class_name in enumerate(classes)}
     for class_name, topk in overrides.items():
         if class_name not in class_to_idx:
-            raise ValueError(f"Unknown class in --class_topk_overrides: {class_name}")
+            raise ValueError(f"Class không tồn tại trong --class_topk_overrides: {class_name}")
         topk_by_class[class_to_idx[class_name]] = int(topk)
     return topk_by_class
 
@@ -266,7 +286,7 @@ def apply_class_weight_overrides(
     class_to_idx = {class_name: idx for idx, class_name in enumerate(classes)}
     for class_name, multiplier in overrides.items():
         if class_name not in class_to_idx:
-            raise ValueError(f"Unknown class in --class_weight_overrides: {class_name}")
+            raise ValueError(f"Class không tồn tại trong --class_weight_overrides: {class_name}")
         weights[class_to_idx[class_name]] *= multiplier
     if renormalize:
         weights = weights / weights.mean().clamp(min=1e-12)
@@ -274,7 +294,7 @@ def apply_class_weight_overrides(
 
 
 class ModelEMA:
-    """Exponential moving average of model weights for validation and checkpointing."""
+    """EMA trọng số để validate và lưu checkpoint."""
 
     def __init__(self, model: torch.nn.Module, decay: float = DEFAULT_EMA_DECAY) -> None:
         self.ema = copy.deepcopy(model).eval()
@@ -446,14 +466,10 @@ def save_checkpoint(
     model_config: dict | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    compact_state = {
-        key: value.detach().cpu().half() if torch.is_floating_point(value) else value.detach().cpu()
-        for key, value in model.state_dict().items()
-    }
     torch.save(
         {
             "epoch": epoch,
-            "model": compact_state,
+            "model": state_dict_for_save(model, half=True),
             "classes": classes,
             "metrics": metrics,
             "model_config": model_config or {},
@@ -462,16 +478,151 @@ def save_checkpoint(
     )
 
 
+def state_dict_for_save(model, half: bool = False) -> dict:
+    state = {}
+    for key, value in model.state_dict().items():
+        value = value.detach().cpu()
+        if half and torch.is_floating_point(value):
+            value = value.half()
+        state[key] = value
+    return state
+
+
+def save_training_checkpoint(
+    path: Path,
+    model,
+    eval_model,
+    optimizer,
+    scheduler,
+    scaler,
+    ema: ModelEMA | None,
+    epoch: int,
+    classes: list[str],
+    metrics: dict,
+    model_config: dict,
+    best_map: float,
+    best_epoch: int,
+    epochs_without_improvement: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint = {
+        "epoch": epoch,
+        "model": state_dict_for_save(eval_model, half=True),
+        "train_model": state_dict_for_save(unwrap_model(model), half=False),
+        "classes": classes,
+        "metrics": metrics,
+        "model_config": model_config,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+        "ema": state_dict_for_save(ema.ema, half=False) if ema is not None else None,
+        "ema_updates": ema.updates if ema is not None else 0,
+        "training_state": {
+            "best_map": best_map,
+            "best_epoch": best_epoch,
+            "epochs_without_improvement": epochs_without_improvement,
+        },
+    }
+    torch.save(checkpoint, path)
+
+
+def load_resume_checkpoint(
+    path: str | Path,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    ema: ModelEMA | None,
+    device: torch.device,
+    logger: logging.Logger,
+    classes: list[str],
+) -> dict:
+    checkpoint_path = Path(path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Không tìm thấy checkpoint resume: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(checkpoint, dict):
+        model.load_state_dict(checkpoint)
+        logger.info("Đã resume trọng số từ state dict thô: %s", checkpoint_path)
+        return {
+            "start_epoch": 1,
+            "best_map": -1.0,
+            "best_epoch": 0,
+            "epochs_without_improvement": 0,
+            "full_state": False,
+        }
+
+    checkpoint_classes = checkpoint.get("classes")
+    if checkpoint_classes is not None and list(checkpoint_classes) != list(classes):
+        raise ValueError(
+            "Class trong checkpoint resume không khớp class train hiện tại: "
+            f"{checkpoint_classes} != {classes}"
+        )
+
+    state = checkpoint.get("train_model") or checkpoint.get("model")
+    if state is None:
+        raise KeyError(f"Checkpoint không có state 'train_model' hoặc 'model': {checkpoint_path}")
+    model.load_state_dict(state)
+
+    full_state = "train_model" in checkpoint and "optimizer" in checkpoint
+    if "optimizer" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    if "scheduler" in checkpoint:
+        scheduler.load_state_dict(checkpoint["scheduler"])
+    if "scaler" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler"])
+    if ema is not None:
+        if checkpoint.get("ema") is not None:
+            ema.ema.load_state_dict(checkpoint["ema"])
+            ema.updates = int(checkpoint.get("ema_updates", 0))
+        else:
+            ema.ema.load_state_dict(model.state_dict())
+
+    epoch = int(checkpoint.get("epoch", 0))
+    metrics = checkpoint.get("metrics") or {}
+    training_state = checkpoint.get("training_state") or {}
+    best_map = float(training_state.get("best_map", metrics.get("mAP50", -1.0)))
+    best_epoch = int(training_state.get("best_epoch", epoch if best_map >= 0 else 0))
+    epochs_without_improvement = int(training_state.get("epochs_without_improvement", 0))
+    logger.info(
+        "Đã resume checkpoint %s từ %s tại epoch %d (full_state=%s best_mAP50=%.6f best_epoch=%d)",
+        "training" if full_state else "chỉ trọng số",
+        checkpoint_path,
+        epoch,
+        full_state,
+        best_map,
+        best_epoch,
+    )
+    return {
+        "start_epoch": epoch + 1 if epoch > 0 else 1,
+        "best_map": best_map,
+        "best_epoch": best_epoch,
+        "epochs_without_improvement": epochs_without_improvement,
+        "full_state": full_state,
+    }
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Train YOLOv8 with ImageNet-pretrained ConvNeXt V2 Tiny backbone")
+    parser = argparse.ArgumentParser("Huấn luyện YOLOv8 với backbone ConvNeXt V2 Tiny pretrained ImageNet")
     parser.add_argument("--data_root", default="final_public/public")
-    parser.add_argument("--train_data", help="Submission CLI alias for ./public/annotations/train.json")
-    parser.add_argument("--val_data", help="Submission CLI alias for ./public/annotations/val.json")
-    parser.add_argument("--image_dir", help="Submission CLI compatibility argument; images are resolved through data_root.")
-    parser.add_argument("--val_image_dir", help="Submission CLI compatibility argument; images are resolved through data_root.")
-    parser.add_argument("--checkpoint_dir", help="Submission CLI alias for --output_dir; saves best.pth directly here.")
+    parser.add_argument("--train_data", help="Alias CLI cho ./public/annotations/train.json")
+    parser.add_argument("--val_data", help="Alias CLI cho ./public/annotations/val.json")
+    parser.add_argument("--image_dir", help=" ảnh lấy theo data_root.")
+    parser.add_argument("--val_image_dir", help=" ảnh val lấy theo data_root.")
+    parser.add_argument("--checkpoint_dir", help="Alias cho --output_dir; lưu best.pth và last.pth trực tiếp tại đây.")
+    parser.add_argument(
+        "--resume",
+        help="Resume train từ checkpoint. Phải dùng last.pth để giữ optimizer/scheduler/EMA.",
+    )
     parser.add_argument("--img_size", type=int, default=DEFAULT_IMG_SIZE)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument(
+        "--scheduler_epochs",
+        type=int,
+        default=DEFAULT_SCHEDULER_EPOCHS,
+        help="T_max của cosine LR theo epoch.",
+    )
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
@@ -486,51 +637,45 @@ def parse_args() -> argparse.Namespace:
         "--class_weighting",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use sqrt-inverse class weights from the train split for positive classification loss.",
+        help="Dùng trọng số class sqrt-inverse từ train split cho loss phân loại positive.",
     )
     parser.add_argument(
         "--class_weight_overrides",
         default=DEFAULT_CLASS_WEIGHT_OVERRIDES,
-        help="Comma-separated positive class-weight multipliers, e.g. chair=1.6,car=1.1.",
+        help="Multiplier class-weight positive, cách nhau bằng dấu phẩy, ví dụ chair=1.6,car=1.1.",
     )
     parser.add_argument(
         "--class_weight_renorm",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Renormalize class weights to mean 1 after applying per-class multipliers.",
+        help="Chuẩn hóa lại class weights về mean 1 sau khi áp multiplier.",
     )
     parser.add_argument(
         "--assign_topk",
         type=int,
         default=10,
-        help="Default TaskAligned assignment top_k for each class.",
+        help="top_k mặc định của TaskAligned assignment cho mỗi class.",
     )
     parser.add_argument(
         "--class_topk_overrides",
         default=DEFAULT_CLASS_TOPK_OVERRIDES,
-        help="Comma-separated per-class assignment top_k overrides, e.g. chair=6,car=12.",
+        help="Override top_k theo class, cách nhau bằng dấu phẩy, ví dụ chair=6,car=12.",
     )
     parser.add_argument(
         "--quality_targets",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Scale positive classification targets by assignment quality instead of using binary 1.0 targets.",
+        help="Scale target phân loại positive theo quality thay vì dùng nhãn 1.0.",
     )
     parser.add_argument(
         "--quality_target_floor",
         type=float,
         default=DEFAULT_QUALITY_TARGET_FLOOR,
-        help="Minimum positive classification target when --quality_targets is enabled.",
+        help="Giá trị target positive tối thiểu khi bật --quality_targets.",
     )
     parser.add_argument("--freeze_backbone_epochs", type=int, default=DEFAULT_FREEZE_BACKBONE_EPOCHS)
     parser.add_argument("--early_stop_patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
     parser.add_argument("--min_delta", type=float, default=DEFAULT_MIN_DELTA)
-    parser.add_argument(
-        "--alter_best_min_map",
-        type=float,
-        default=DEFAULT_ALTER_BEST_MIN_MAP,
-        help="Save alter_best.pth as the latest epoch whose mAP50 is at least this value. Set <0 to disable.",
-    )
     parser.add_argument("--num_runs", type=int, default=DEFAULT_NUM_RUNS)
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument(
@@ -539,7 +684,7 @@ def parse_args() -> argparse.Namespace:
         dest="ema",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use exponential moving average weights for validation and saved checkpoints.",
+        help="Dùng trọng số EMA để validate và lưu checkpoint.",
     )
     parser.add_argument("--ema_decay", type=float, default=DEFAULT_EMA_DECAY)
     parser.add_argument("--no_aug", action="store_true")
@@ -547,57 +692,58 @@ def parse_args() -> argparse.Namespace:
         "--mosaic",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use YOLO-style 4-image mosaic augmentation during training.",
+        help="Thêm sample oversampling mosaic 4 ảnh kiểu YOLO vào epoch train.",
     )
-    parser.add_argument("--mosaic_p", type=float, default=DEFAULT_MOSAIC_P)
+    parser.add_argument(
+        "--mosaic_oversample",
+        type=float,
+        default=DEFAULT_MOSAIC_OVERSAMPLE,
+        help=(
+            "Số sample mosaic thêm trên mỗi ảnh train gốc. Với equalizer mặc định, "
+            "0.95 giữ mosaic khoảng 30%% số sample train."
+        ),
+    )
+    parser.add_argument("--mosaic_p", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--box_type_equalizer",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Scale train images to synthesize under-represented box-size buckets per class before Albumentations.",
+        help="Oversample sample train để bù bucket kích thước bbox thiếu theo class trước Albumentations.",
     )
     parser.add_argument(
         "--box_shape_equalizer",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Anisotropically scale train images to synthesize under-represented box-shape buckets per class before Albumentations.",
+        help="Oversample sample train để bù bucket dáng bbox thiếu theo class trước Albumentations.",
     )
     parser.add_argument(
-        "--positive_sampling",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use weighted train sampling to reduce empty-image dominance and oversample weak/small-object positives.",
+        "--box_equalizer_oversample",
+        default=DEFAULT_BOX_EQUALIZER_OVERSAMPLE,
+        help=(
+            "Mức oversample equalizer theo class, cách nhau bằng dấu phẩy, ví dụ "
+            "chair=1.0,cat=0.5. 1.0 thêm một sample giả cho mỗi thiếu hụt bucket."
+        ),
     )
-    parser.add_argument(
-        "--positive_focus_classes",
-        default=DEFAULT_POSITIVE_FOCUS_CLASSES,
-        help="Comma-separated classes that get extra sampling weight, e.g. chair,car. Empty string disables focus boost.",
-    )
-    parser.add_argument("--positive_empty_weight", type=float, default=0.5)
-    parser.add_argument("--positive_focus_class_boost", type=float, default=1.5)
-    parser.add_argument("--positive_tiny_box_boost", type=float, default=1.8)
-    parser.add_argument("--positive_small_box_boost", type=float, default=1.3)
     parser.add_argument(
         "--neck_depth",
         type=int,
         default=DEFAULT_NECK_DEPTH,
-        help="C2f block depth in the PAN/FPN neck. 1 matches the previous baseline; 2 is a stronger neck.",
+        help="Độ sâu block C2f trong PAN/FPN neck. 1 giống baseline cũ; 2 mạnh hơn.",
     )
     parser.add_argument(
         "--head_depth",
         type=int,
         default=DEFAULT_HEAD_DEPTH,
-        help="Number of Conv layers before each detect output. 2 matches the previous baseline; 3 adds light head depth.",
+        help="Số lớp Conv trước mỗi detect output. 2 giống baseline cũ; 3 sâu hơn nhẹ.",
     )
     parser.add_argument("--scratch_backbone", action="store_true")
     parser.add_argument(
         "--p2_head",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Add a stride-4 P2 detection head for small objects. Starts a new incompatible checkpoint architecture.",
+        help="Thêm detect head P2 stride-4 cho object nhỏ.",
     )
-    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Set to -1 to disable fixed seeding.")
-    parser.add_argument("--deterministic", action="store_true", help="Use deterministic PyTorch kernels when available.")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Đặt -1 để tắt seed cố định.")
     parser.add_argument("--local_rank", type=int, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -605,34 +751,34 @@ def parse_args() -> argparse.Namespace:
     if args.train_data:
         train_data = Path(args.train_data)
         if train_data.name != "train.json":
-            raise ValueError("--train_data should point to annotations/train.json")
+            raise ValueError("--train_data nên trỏ tới annotations/train.json")
         args.data_root = str(train_data.parent.parent)
     if args.checkpoint_dir:
         args.output_dir = args.checkpoint_dir
         args.flat_checkpoint_dir = True
     if not 0.0 <= args.ema_decay < 1.0:
-        raise ValueError("--ema_decay must be in [0, 1)")
-    if not 0.0 <= args.mosaic_p <= 1.0:
-        raise ValueError("--mosaic_p must be in [0, 1]")
+        raise ValueError("--ema_decay phải nằm trong [0, 1)")
+    if args.mosaic_p is not None:
+        args.mosaic_oversample = args.mosaic_p
+    delattr(args, "mosaic_p")
+    if args.mosaic_oversample < 0:
+        raise ValueError("--mosaic_oversample phải >= 0")
+    if args.scheduler_epochs <= 0:
+        raise ValueError("--scheduler_epochs phải > 0")
     if args.neck_depth < 1:
-        raise ValueError("--neck_depth must be >= 1")
+        raise ValueError("--neck_depth phải >= 1")
     if args.head_depth < 1:
-        raise ValueError("--head_depth must be >= 1")
+        raise ValueError("--head_depth phải >= 1")
     if args.assign_topk <= 0:
-        raise ValueError("--assign_topk must be > 0")
-    if args.positive_empty_weight < 0:
-        raise ValueError("--positive_empty_weight must be >= 0")
-    if args.positive_focus_class_boost <= 0:
-        raise ValueError("--positive_focus_class_boost must be > 0")
-    if args.positive_tiny_box_boost <= 0:
-        raise ValueError("--positive_tiny_box_boost must be > 0")
-    if args.positive_small_box_boost <= 0:
-        raise ValueError("--positive_small_box_boost must be > 0")
+        raise ValueError("--assign_topk phải > 0")
     if not 0.0 <= args.quality_target_floor <= 1.0:
-        raise ValueError("--quality_target_floor must be in [0, 1]")
-    args.positive_focus_classes = parse_class_list(args.positive_focus_classes)
+        raise ValueError("--quality_target_floor phải nằm trong [0, 1]")
     args.class_weight_overrides = parse_class_weight_overrides(args.class_weight_overrides)
     args.class_topk_overrides = parse_class_topk_overrides(args.class_topk_overrides)
+    args.box_equalizer_oversample = parse_class_float_overrides(
+        args.box_equalizer_oversample,
+        "--box_equalizer_oversample",
+    )
     return args
 
 
@@ -655,28 +801,29 @@ def train_single_run(
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     classes = load_classes(args.data_root)
+    validate_class_names(args.box_equalizer_oversample, classes, "--box_equalizer_oversample")
     run_seed = args.seed + run_idx if args.seed >= 0 else None
     local_batch_size = per_device_batch_size(args.batch_size, world_size)
 
-    logger.info("Starting training run %d/%d", run_idx + 1, args.num_runs)
-    logger.info("Log file: %s", log_path)
-    logger.info("Output dir: %s", output_dir)
-    logger.info("Args: %s", json.dumps(vars(args), ensure_ascii=False, sort_keys=True))
-    logger.info("Device: %s", device)
-    logger.info("Distributed: enabled=%s rank=%d local_rank=%d world_size=%d", distributed, rank, local_rank, world_size)
+    logger.info("Bắt đầu lượt train %d/%d", run_idx + 1, args.num_runs)
+    logger.info("File log: %s", log_path)
+    logger.info("Thư mục output: %s", output_dir)
+    logger.info("Tham số: %s", json.dumps(vars(args), ensure_ascii=False, sort_keys=True))
+    logger.info("Thiết bị: %s", device)
+    logger.info("Distributed: bật=%s rank=%d local_rank=%d world_size=%d", distributed, rank, local_rank, world_size)
     logger.info(
-        "Batch size: global=%d per_device=%d",
+        "Batch size: global=%d mỗi_thiết_bị=%d",
         args.batch_size,
         local_batch_size,
     )
     logger.info("Classes (%d): %s", len(classes), ", ".join(classes))
-    logger.info("Run index: %d", run_idx)
+    logger.info("Chỉ số run: %d", run_idx)
 
     if run_seed is not None:
-        set_seed(run_seed, deterministic=args.deterministic)
-        logger.info("Seed: %d deterministic=%s", run_seed, args.deterministic)
+        set_seed(run_seed)
+        logger.info("Seed: %d", run_seed)
     else:
-        logger.info("Seed: disabled")
+        logger.info("Seed: tắt")
     transforms = None if args.no_aug else albumentations_transform()
     train_loader = build_dataloader(
         args.data_root,
@@ -688,37 +835,32 @@ def train_single_run(
         seed=run_seed,
         box_type_equalizer=args.box_type_equalizer,
         box_shape_equalizer=args.box_shape_equalizer,
+        box_equalizer_oversample=args.box_equalizer_oversample,
         mosaic=args.mosaic and not args.no_aug,
-        mosaic_p=args.mosaic_p,
-        positive_sampling=args.positive_sampling,
-        positive_focus_classes=args.positive_focus_classes,
-        positive_empty_weight=args.positive_empty_weight,
-        positive_focus_class_boost=args.positive_focus_class_boost,
-        positive_tiny_box_boost=args.positive_tiny_box_boost,
-        positive_small_box_boost=args.positive_small_box_boost,
+        mosaic_oversample=args.mosaic_oversample,
         distributed=distributed,
         rank=rank,
         world_size=world_size,
     )
-    if is_main_process(rank) and args.positive_sampling:
-        sampling_stats = getattr(train_loader.dataset, "positive_sampling_stats", None)
-        if sampling_stats is not None:
+    if is_main_process(rank):
+        sample_plan_stats = getattr(train_loader.dataset, "sample_plan_stats", None)
+        if sample_plan_stats is not None:
             logger.info(
-                "Positive sampling stats: %s",
-                json.dumps(sampling_stats, ensure_ascii=False, sort_keys=True),
+                "Kế hoạch sample train: %s",
+                json.dumps(sample_plan_stats, ensure_ascii=False, sort_keys=True),
             )
     if is_main_process(rank) and args.box_type_equalizer:
         equalizer = getattr(train_loader.dataset, "box_type_equalizer", None)
         if equalizer is not None:
             logger.info(
-                "Box type equalizer stats: %s",
+                "Thống kê equalizer kích thước bbox: %s",
                 json.dumps(equalizer.stats(), ensure_ascii=False, sort_keys=True),
             )
     if is_main_process(rank) and args.box_shape_equalizer:
         equalizer = getattr(train_loader.dataset, "box_shape_equalizer", None)
         if equalizer is not None:
             logger.info(
-                "Box shape equalizer stats: %s",
+                "Thống kê equalizer dáng bbox: %s",
                 json.dumps(equalizer.stats(), ensure_ascii=False, sort_keys=True),
             )
     val_loader = None
@@ -768,9 +910,9 @@ def train_single_run(
         default_topk=args.assign_topk,
         overrides=args.class_topk_overrides,
     )
-    logger.info("Train class counts: %s", json.dumps(class_counts, ensure_ascii=False, sort_keys=True))
+    logger.info("Số bbox theo class train: %s", json.dumps(class_counts, ensure_ascii=False, sort_keys=True))
     logger.info(
-        "Class weighting: enabled=%s scheme=sqrt_inverse multipliers=%s renorm=%s base_weights=%s weights=%s",
+        "Class weighting: bật=%s scheme=sqrt_inverse multipliers=%s renorm=%s base_weights=%s weights=%s",
         args.class_weighting,
         json.dumps(args.class_weight_overrides, ensure_ascii=False, sort_keys=True),
         args.class_weight_renorm,
@@ -778,15 +920,15 @@ def train_single_run(
         json.dumps({class_name: round(float(weight), 6) for class_name, weight in zip(classes, class_weights)}),
     )
     logger.info(
-        "Assignment top_k: default=%d overrides=%s per_class=%s",
+        "Assignment top_k: mặc_định=%d overrides=%s theo_class=%s",
         args.assign_topk,
         json.dumps(args.class_topk_overrides, ensure_ascii=False, sort_keys=True),
         json.dumps({class_name: int(topk) for class_name, topk in zip(classes, class_topk)}),
     )
     logger.info(
-        "Mosaic: enabled=%s p=%.3f equalizers_apply_only_to_non_mosaic_samples=true",
+        "Oversampling mosaic: bật=%s ratio=%.3f",
         args.mosaic and not args.no_aug,
-        args.mosaic_p,
+        args.mosaic_oversample,
     )
     criterion = YOLOv8Loss(
         num_classes=len(classes),
@@ -799,7 +941,7 @@ def train_single_run(
         quality_target_floor=args.quality_target_floor,
     )
     logger.info(
-        "Quality targets: enabled=%s floor=%.6g",
+        "Quality targets: bật=%s floor=%.6g",
         args.quality_targets,
         args.quality_target_floor,
     )
@@ -812,35 +954,68 @@ def train_single_run(
     )
     scheduler = CosineAnnealingLR(
         optimizer,
-        T_max=max(args.epochs, 1),
+        T_max=max(args.scheduler_epochs, 1),
         eta_min=min(args.lr, args.backbone_lr) * 0.05,
     )
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and not args.no_amp))
+    start_epoch = 1
+    best_map = -1.0
+    best_epoch = 0
+    epochs_without_improvement = 0
+    if args.resume:
+        resume_state = load_resume_checkpoint(
+            path=args.resume,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            ema=ema,
+            device=device,
+            logger=logger,
+            classes=classes,
+        )
+        start_epoch = int(resume_state["start_epoch"])
+        best_map = float(resume_state["best_map"])
+        best_epoch = int(resume_state["best_epoch"])
+        epochs_without_improvement = int(resume_state["epochs_without_improvement"])
     if distributed:
         if device.type == "cuda":
             model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
         else:
             model = DDP(model, find_unused_parameters=True)
-    set_backbone_trainable(model, args.freeze_backbone_epochs <= 0)
-    best_map = -1.0
-    best_epoch = 0
-    alter_best_epoch = 0
-    alter_best_map = -1.0
-    epochs_without_improvement = 0
+    set_backbone_trainable(model, args.freeze_backbone_epochs <= 0 or start_epoch > args.freeze_backbone_epochs)
     logger.info(
-        "Optimizer groups: lr=%.6g backbone_lr=%.6g weight_decay=%.6g",
+        "Nhóm optimizer: lr=%.6g backbone_lr=%.6g weight_decay=%.6g",
         args.lr,
         args.backbone_lr,
         args.weight_decay,
     )
-    logger.info("EMA: enabled=%s decay=%.6g", args.ema, args.ema_decay)
-    logger.info("Model config: %s", json.dumps(model_config, ensure_ascii=False, sort_keys=True))
+    logger.info(
+        "Scheduler: cosine_T_max_epochs=%d train_epochs=%d",
+        args.scheduler_epochs,
+        args.epochs,
+    )
+    logger.info("EMA: bật=%s decay=%.6g", args.ema, args.ema_decay)
+    logger.info("Cấu hình model: %s", json.dumps(model_config, ensure_ascii=False, sort_keys=True))
 
-    for epoch in range(1, args.epochs + 1):
+    if start_epoch > args.epochs:
+        logger.info("Epoch resume %d vượt quá --epochs=%d; không chạy epoch train nào.", start_epoch, args.epochs)
+
+    for epoch in range(start_epoch, args.epochs + 1):
         set_sampler_epoch(train_loader, epoch)
+        if is_main_process(rank):
+            sample_plan_stats = getattr(train_loader.dataset, "sample_plan_stats", None)
+            if sample_plan_stats is not None:
+                logger.info(
+                    "Kế hoạch sample train epoch %d đã làm mới: items=%d by_mode=%s mode_ratios=%s",
+                    epoch,
+                    sample_plan_stats["dataset_items"],
+                    json.dumps(sample_plan_stats["by_mode"], ensure_ascii=False, sort_keys=True),
+                    json.dumps(sample_plan_stats["mode_ratios"], ensure_ascii=False, sort_keys=True),
+                )
         if epoch == args.freeze_backbone_epochs + 1:
             set_backbone_trainable(model, True)
-            logger.info("Unfroze ConvNeXt V2 Tiny feature extractor at epoch %d", epoch)
+            logger.info("Đã mở đóng băng feature extractor ConvNeXt V2 Tiny tại epoch %d", epoch)
 
         train_metrics = train_one_epoch(
             model,
@@ -903,27 +1078,16 @@ def train_single_run(
                 metrics["lr_backbone"],
                 metrics["lr"],
             )
-            if args.alter_best_min_map >= 0 and metrics["mAP50"] >= args.alter_best_min_map:
-                alter_best_epoch = epoch
-                alter_best_map = metrics["mAP50"]
-                save_checkpoint(output_dir / "alter_best.pth", eval_model, epoch, classes, metrics, model_config)
-                logger.info(
-                    "Saved alter_best checkpoint: mAP50=%.6f at epoch %d "
-                    "(latest epoch with mAP50 >= %.6f)",
-                    alter_best_map,
-                    epoch,
-                    args.alter_best_min_map,
-                )
             if metrics["mAP50"] > best_map + args.min_delta:
                 best_map = metrics["mAP50"]
                 best_epoch = epoch
                 epochs_without_improvement = 0
                 save_checkpoint(output_dir / "best.pth", eval_model, epoch, classes, metrics, model_config)
-                logger.info("Saved new best checkpoint: mAP50=%.6f at epoch %d", best_map, epoch)
+                logger.info("Đã lưu checkpoint tốt nhất mới: mAP50=%.6f tại epoch %d", best_map, epoch)
             else:
                 epochs_without_improvement += 1
                 logger.info(
-                    "No mAP50 improvement for %d/%d epoch(s). Best mAP50=%.6f at epoch %d",
+                    "mAP50 chưa cải thiện trong %d/%d epoch. mAP50 tốt nhất=%.6f tại epoch %d",
                     epochs_without_improvement,
                     args.early_stop_patience,
                     best_map,
@@ -931,12 +1095,29 @@ def train_single_run(
                 )
                 if args.early_stop_patience > 0 and epochs_without_improvement >= args.early_stop_patience:
                     logger.info(
-                        "Early stopping at epoch %d. Best mAP50=%.6f at epoch %d",
+                        "Dừng sớm tại epoch %d. mAP50 tốt nhất=%.6f tại epoch %d",
                         epoch,
                         best_map,
                         best_epoch,
                     )
                     stop_training = True
+            save_training_checkpoint(
+                output_dir / "last.pth",
+                model=model,
+                eval_model=eval_model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                ema=ema,
+                epoch=epoch,
+                classes=classes,
+                metrics=metrics,
+                model_config=model_config,
+                best_map=best_map,
+                best_epoch=best_epoch,
+                epochs_without_improvement=epochs_without_improvement,
+            )
+            logger.info("Đã lưu checkpoint resume: %s", output_dir / "last.pth")
 
         if distributed:
             stop_tensor = torch.tensor(1 if stop_training else 0, device=device, dtype=torch.int)
@@ -946,16 +1127,13 @@ def train_single_run(
             break
 
     if is_main_process(rank):
-        if alter_best_epoch:
-            logger.info("Training finished. Best mAP50: %.6f | alter_best mAP50: %.6f at epoch %d", best_map, alter_best_map, alter_best_epoch)
-        else:
-            logger.info("Training finished. Best mAP50: %.6f | no alter_best checkpoint met mAP50 >= %.6f", best_map, args.alter_best_min_map)
+        logger.info("Train hoàn tất. mAP50 tốt nhất: %.6f tại epoch %d", best_map, best_epoch)
 
 
 def main() -> None:
     args = parse_args()
     if args.num_runs < 1:
-        raise ValueError("--num_runs must be >= 1")
+        raise ValueError("--num_runs phải >= 1")
 
     distributed, rank, local_rank, world_size = setup_distributed()
     try:

@@ -45,12 +45,12 @@ def setup_eval_logger(log_dir: str | Path, checkpoint: str | Path) -> tuple[logg
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Evaluate a trained YOLOv8 checkpoint")
+    parser = argparse.ArgumentParser("Đánh giá checkpoint YOLOv8 đã train")
     parser.add_argument("--checkpoint")
     parser.add_argument(
         "--checkpoint_name",
         default="best",
-        help="Checkpoint filename stem to evaluate when --checkpoint is not set, e.g. best or alter_best.",
+        help="Tên checkpoint không kèm .pth khi chưa đặt --checkpoint",
     )
     parser.add_argument("--checkpoint_root", default="models")
     parser.add_argument("--data_root", default="final_public/public")
@@ -81,7 +81,7 @@ def run_official_evaluator(
     evaluator_path = Path(evaluator_path)
     spec = importlib.util.spec_from_file_location("public_evaluate_predictions", evaluator_path)
     if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load official evaluator from {evaluator_path}")
+        raise ImportError(f"Không tải được bộ đánh giá từ {evaluator_path}")
 
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -150,11 +150,11 @@ def evaluate_checkpoint(
     log_dir = run_dir(args.log_dir, f"eval_{experiment}", run_idx)
     logger, log_path = setup_eval_logger(log_dir, checkpoint_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("Starting evaluation run %d/%d", run_idx + 1, num_runs)
-    logger.info("Log file: %s", log_path)
+    logger.info("Bắt đầu eval %d/%d", run_idx + 1, num_runs)
+    logger.info("File log: %s", log_path)
     logger.info("Checkpoint: %s", checkpoint_path)
-    logger.info("Args: %s", json.dumps(vars(args), ensure_ascii=False, sort_keys=True))
-    logger.info("Device: %s", device)
+    logger.info("Tham số: %s", json.dumps(vars(args), ensure_ascii=False, sort_keys=True))
+    logger.info("Thiết bị: %s", device)
 
     classes = load_classes(args.data_root, split=args.split)
     model, checkpoint = load_model(checkpoint_path, len(classes), device)
@@ -162,9 +162,9 @@ def evaluate_checkpoint(
         classes = checkpoint["classes"]
     logger.info("Classes (%d): %s", len(classes), ", ".join(classes))
     if checkpoint.get("epoch") is not None:
-        logger.info("Checkpoint epoch: %s", checkpoint["epoch"])
+        logger.info("Epoch checkpoint: %s", checkpoint["epoch"])
     if checkpoint.get("metrics"):
-        logger.info("Checkpoint stored metrics: %s", json.dumps(checkpoint["metrics"], ensure_ascii=False, sort_keys=True))
+        logger.info("Metric đã lưu trong checkpoint: %s", json.dumps(checkpoint["metrics"], ensure_ascii=False, sort_keys=True))
 
     loader = build_dataloader(
         args.data_root,
@@ -187,8 +187,8 @@ def evaluate_checkpoint(
 
     metrics_text = json.dumps(metrics, ensure_ascii=False, indent=2)
     logger.info(
-        "Evaluation metrics: mAP50=%.6f val_loss=%.6f P@eval=%.6f R@eval=%.6f "
-        "P@0.25=%.6f R@0.25=%.6f P@0.50=%.6f R@0.50=%.6f num_predictions=%d",
+        "Metric đánh giá: mAP50=%.6f val_loss=%.6f P@eval=%.6f R@eval=%.6f "
+        "P@0.25=%.6f R@0.25=%.6f P@0.50=%.6f R@0.50=%.6f số_dự_đoán=%d",
         metrics["mAP50"],
         metrics["val_loss"],
         metrics["precision"],
@@ -199,10 +199,10 @@ def evaluate_checkpoint(
         metrics["recall@0.5"],
         metrics["num_predictions"],
     )
-    logger.info("Full metrics JSON:\n%s", metrics_text)
+    logger.info("JSON metric đầy đủ:\n%s", metrics_text)
     metrics_output = output_path(args.metrics_output, "metrics", experiment, run_idx, num_runs)
     write_json(metrics_output, metrics)
-    logger.info("Wrote metrics JSON to %s", metrics_output)
+    logger.info("Đã ghi metrics JSON vào %s", metrics_output)
 
     source = Path(args.data_root) / args.split / "images"
     annotation_index = load_annotation_index(args.data_root, args.split)
@@ -223,7 +223,7 @@ def evaluate_checkpoint(
 
     predictions_output = output_path(args.predictions_output, "predictions", experiment, run_idx, num_runs)
     write_json(predictions_output, predictions)
-    logger.info("Wrote predictions JSON to %s", predictions_output)
+    logger.info("Đã ghi JSON dự đoán vào %s", predictions_output)
 
     official_ground_truth = args.official_ground_truth or str(Path(args.data_root) / "annotations" / f"{args.split}.json")
     official_score_output = output_path(args.official_score_output, "score", experiment, run_idx, num_runs)
@@ -235,13 +235,13 @@ def evaluate_checkpoint(
         max_detections_per_image=args.max_det,
     )
     logger.info(
-        "Official evaluator: mAP@0.5=%.6f micro_P=%.6f micro_R=%.6f predictions=%d",
+        "Bộ đánh giá official: mAP@0.5=%.6f micro_P=%.6f micro_R=%.6f số_dự_đoán=%d",
         official_metrics["mAP@0.5"],
         official_metrics["micro_precision"],
         official_metrics["micro_recall"],
         official_metrics["num_predictions"],
     )
-    logger.info("Wrote official score JSON to %s", official_score_output)
+    logger.info("Đã ghi JSON điểm official vào %s", official_score_output)
     return {
         "run": run_idx,
         "checkpoint": str(checkpoint_path),
@@ -256,7 +256,7 @@ def evaluate_checkpoint(
 def main() -> None:
     args = parse_args()
     if args.num_runs < 1:
-        raise ValueError("--num_runs must be >= 1")
+        raise ValueError("--num_runs phải >= 1")
 
     checkpoint_experiment = "base"
     experiment = "base" if args.checkpoint_name == "best" else f"base_{args.checkpoint_name}"
@@ -280,7 +280,7 @@ def main() -> None:
     summaries = []
     for run_idx, checkpoint_path in checkpoints:
         if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+            raise FileNotFoundError(f"Không tìm thấy checkpoint: {checkpoint_path}")
         summaries.append(
             evaluate_checkpoint(
                 args=args,
@@ -294,7 +294,7 @@ def main() -> None:
     if len(summaries) > 1:
         summary_path = Path(f"score_{experiment}_summary.json")
         write_json(summary_path, summaries)
-        print(f"wrote evaluation summary to {summary_path}")
+        print(f"Đã ghi tóm tắt đánh giá vào {summary_path}")
 
 if __name__ == "__main__":
     main()

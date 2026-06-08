@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate object detection predictions and compute mAP@0.5."""
+"""Validate dự đoán object detection và tính mAP@0.5."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate object detection predictions.")
+    parser = argparse.ArgumentParser(description="Đánh giá dự đoán object detection.")
     parser.add_argument("--ground_truth", required=True, type=Path)
     parser.add_argument("--predictions", required=True, type=Path)
     parser.add_argument("--output", type=Path)
@@ -20,12 +20,12 @@ def parse_args() -> argparse.Namespace:
         "--max_detections_per_image",
         type=int,
         default=100,
-        help="Keep at most this many detections per image after sorting by confidence.",
+        help="Giữ tối đa số bbox này mỗi ảnh sau khi sort theo độ tin cậy.",
     )
     parser.add_argument(
         "--allow_missing_images",
         action="store_true",
-        help="Allow predictions.json to omit images. By default every image must appear once.",
+        help="Cho phép predictions.json thiếu ảnh. Mặc định mỗi ảnh phải xuất hiện một lần.",
     )
     return parser.parse_args()
 
@@ -58,43 +58,43 @@ def bbox_iou(box_a: list[float], box_b: list[float]) -> float:
 
 def validate_ground_truth(data: dict[str, Any]) -> tuple[list[str], dict[str, dict[str, Any]]]:
     if not isinstance(data, dict):
-        raise ValueError("Ground truth must be a JSON object.")
+        raise ValueError("Dữ liệu thật phải là JSON object.")
 
     classes = data.get("classes")
     images = data.get("images")
     annotations = data.get("annotations")
 
     if not isinstance(classes, list) or not all(isinstance(item, str) for item in classes):
-        raise ValueError("Ground truth field 'classes' must be a list of strings.")
+        raise ValueError("Field 'classes' của dữ liệu thật phải là list string.")
     if not isinstance(images, list):
-        raise ValueError("Ground truth field 'images' must be a list.")
+        raise ValueError("Field 'images' của dữ liệu thật phải là list.")
     if not isinstance(annotations, list):
-        raise ValueError("Ground truth field 'annotations' must be a list.")
+        raise ValueError("Field 'annotations' của dữ liệu thật phải là list.")
 
     image_info: dict[str, dict[str, Any]] = {}
     for image in images:
         if not isinstance(image, dict):
-            raise ValueError("Each ground truth image entry must be an object.")
+            raise ValueError("Mỗi image trong dữ liệu thật phải là object.")
         image_id = image.get("id")
         width = image.get("width")
         height = image.get("height")
         if not isinstance(image_id, str) or not image_id:
-            raise ValueError("Each ground truth image needs a non-empty string id.")
+            raise ValueError("Mỗi image dữ liệu thật cần id string không rỗng.")
         if not isinstance(width, int) or not isinstance(height, int) or width <= 0 or height <= 0:
-            raise ValueError(f"Image {image_id} has invalid width/height.")
+            raise ValueError(f"Image {image_id} có width/height không hợp lệ.")
         image_info[image_id] = image
 
     class_set = set(classes)
     for ann in annotations:
         if not isinstance(ann, dict):
-            raise ValueError("Each ground truth annotation must be an object.")
+            raise ValueError("Mỗi annotation dữ liệu thật phải là object.")
         image_id = ann.get("image_id")
         class_name = ann.get("class")
         bbox = ann.get("bbox")
         if image_id not in image_info:
-            raise ValueError(f"Annotation references unknown image_id: {image_id}")
+            raise ValueError(f"Annotation trỏ tới image_id không tồn tại: {image_id}")
         if class_name not in class_set:
-            raise ValueError(f"Annotation uses unknown class: {class_name}")
+            raise ValueError(f"Annotation dùng class không tồn tại: {class_name}")
         validate_bbox(bbox, image_info[image_id], context=f"ground truth {image_id}")
 
     return classes, image_info
@@ -102,18 +102,18 @@ def validate_ground_truth(data: dict[str, Any]) -> tuple[list[str], dict[str, di
 
 def validate_bbox(bbox: Any, image: dict[str, Any], context: str) -> list[float]:
     if not isinstance(bbox, list) or len(bbox) != 4:
-        raise ValueError(f"Invalid bbox in {context}: expected [xmin, ymin, xmax, ymax].")
+        raise ValueError(f"Bbox không hợp lệ trong {context}: cần [xmin, ymin, xmax, ymax].")
     if not all(isinstance(value, (int, float)) for value in bbox):
-        raise ValueError(f"Invalid bbox in {context}: coordinates must be numeric.")
+        raise ValueError(f"Bbox không hợp lệ trong {context}: tọa độ phải là số.")
 
     xmin, ymin, xmax, ymax = [float(value) for value in bbox]
     width = float(image["width"])
     height = float(image["height"])
 
     if xmin < 0 or ymin < 0 or xmax > width or ymax > height:
-        raise ValueError(f"Invalid bbox in {context}: coordinates outside image bounds.")
+        raise ValueError(f"Bbox không hợp lệ trong {context}: tọa độ vượt kích thước ảnh.")
     if xmax <= xmin or ymax <= ymin:
-        raise ValueError(f"Invalid bbox in {context}: xmax/ymax must be larger than xmin/ymin.")
+        raise ValueError(f"Bbox không hợp lệ trong {context}: xmax/ymax phải lớn hơn xmin/ymin.")
 
     return [xmin, ymin, xmax, ymax]
 
@@ -126,7 +126,7 @@ def normalize_predictions(
     require_complete: bool,
 ) -> list[dict[str, Any]]:
     if not isinstance(data, list):
-        raise ValueError("Predictions must be a JSON array.")
+        raise ValueError("Dự đoán phải là JSON array.")
 
     class_set = set(classes)
     seen_images: set[str] = set()
@@ -134,16 +134,16 @@ def normalize_predictions(
 
     for entry in data:
         if not isinstance(entry, dict):
-            raise ValueError("Each prediction entry must be an object.")
+            raise ValueError("Mỗi entry dự đoán phải là object.")
 
         image_id = entry.get("image_id")
         boxes = entry.get("boxes")
         if image_id not in image_info:
-            raise ValueError(f"Prediction references unknown image_id: {image_id}")
+            raise ValueError(f"Dự đoán trỏ tới image_id không tồn tại: {image_id}")
         if image_id in seen_images:
-            raise ValueError(f"Duplicate prediction entry for image_id: {image_id}")
+            raise ValueError(f"Dự đoán bị trùng image_id: {image_id}")
         if not isinstance(boxes, list):
-            raise ValueError(f"Prediction for {image_id} must contain a boxes list.")
+            raise ValueError(f"Dự đoán cho {image_id} phải có list boxes.")
 
         seen_images.add(image_id)
         image = image_info[image_id]
@@ -151,21 +151,21 @@ def normalize_predictions(
         image_boxes = []
         for index, box in enumerate(boxes):
             if not isinstance(box, dict):
-                raise ValueError(f"Prediction box {index} for {image_id} must be an object.")
+                raise ValueError(f"Bbox dự đoán {index} của {image_id} phải là object.")
             class_name = box.get("class")
             confidence = box.get("confidence")
             bbox = box.get("bbox")
             if class_name not in class_set:
-                raise ValueError(f"Prediction for {image_id} uses unknown class: {class_name}")
+                raise ValueError(f"Dự đoán cho {image_id} dùng class không tồn tại: {class_name}")
             if not isinstance(confidence, (int, float)) or confidence < 0 or confidence > 1:
-                raise ValueError(f"Prediction for {image_id} has invalid confidence: {confidence}")
+                raise ValueError(f"Dự đoán cho {image_id} có độ tin cậy không hợp lệ: {confidence}")
 
             image_boxes.append(
                 {
                     "image_id": image_id,
                     "class": class_name,
                     "confidence": float(confidence),
-                    "bbox": validate_bbox(bbox, image, context=f"prediction {image_id}"),
+                    "bbox": validate_bbox(bbox, image, context=f"dự đoán {image_id}"),
                 }
             )
 
@@ -177,7 +177,7 @@ def normalize_predictions(
         if missing:
             preview = ", ".join(missing[:10])
             suffix = "..." if len(missing) > 10 else ""
-            raise ValueError(f"Predictions are missing {len(missing)} image(s): {preview}{suffix}")
+            raise ValueError(f"Dự đoán thiếu {len(missing)} ảnh: {preview}{suffix}")
 
     return normalized
 
@@ -350,3 +350,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+""" python utils/official_evaluator/evaluate_predictions.py \
+  --ground_truth public/annotations/val.json \
+  --predictions predictions.json \
+  --output score.json """

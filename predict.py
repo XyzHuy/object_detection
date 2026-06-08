@@ -10,13 +10,13 @@ from utils.inference import collect_images, load_class_thresholds, load_model, p
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Run inference and write predictions JSON")
+    parser = argparse.ArgumentParser("Chạy suy luận và ghi JSON dự đoán")
     parser.add_argument("--image_dir", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--checkpoint", default="models/best.pth")
     parser.add_argument(
         "--thresholds",
-        help="Optional tuned thresholds JSON. Defaults to models/best_thresholds.json when it exists.",
+        help="File JSON ngưỡng đã tune. Mặc định dùng models/best_thresholds.json nếu có.",
     )
     parser.add_argument("--img_size", type=int)
     parser.add_argument("--conf_threshold", type=float)
@@ -40,14 +40,14 @@ def load_classes_from_checkpoint(checkpoint: dict, checkpoint_path: Path) -> lis
     fallback = Path("public/annotations/train.json")
     if fallback.exists():
         return json.loads(fallback.read_text(encoding="utf-8"))["classes"]
-    raise ValueError(f"Checkpoint {checkpoint_path} does not store classes and {fallback} was not found")
+    raise ValueError(f"Checkpoint {checkpoint_path} không lưu classes và không tìm thấy {fallback}")
 
 
 def main() -> None:
     args = parse_args()
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        raise FileNotFoundError(f"Không tìm thấy checkpoint: {checkpoint_path}")
 
     threshold_path = Path(args.thresholds) if args.thresholds else Path("models/best_thresholds.json")
     threshold_config = load_threshold_config(threshold_path)
@@ -87,8 +87,12 @@ def main() -> None:
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(predictions, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"wrote {len(predictions)} image predictions to {output_path}")
+    print(f"Đã ghi dự đoán cho {len(predictions)} ảnh vào {output_path}")
 
 
 if __name__ == "__main__":
     main()
+""" 
+python predict.py \
+  --image_dir public/val/images \
+  --output predictions.json """
