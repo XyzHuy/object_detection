@@ -53,6 +53,7 @@ def main() -> None:
     threshold_config = load_threshold_config(threshold_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Sử dụng thiết bị: {device}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     classes = load_classes_from_checkpoint(checkpoint, checkpoint_path)
     model, _ = load_model(checkpoint_path, len(classes), device)
