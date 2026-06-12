@@ -71,3 +71,5 @@ predict.py có các flag để điều chỉnh threshold để tăng precsion nh
 --conf_threshold :
 --nms_iou :
 --max_det :
+
+Nếu train bị crash, lỗi có thể do pin_memory trong dataloader

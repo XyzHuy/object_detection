@@ -8,7 +8,7 @@ import math
 import os
 import random
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -48,6 +48,7 @@ DEFAULT_HEAD_DEPTH = 3
 DEFAULT_CLASS_WEIGHT_OVERRIDES = "chair=1.6"
 DEFAULT_CLASS_TOPK_OVERRIDES = "chair=6"
 DEFAULT_QUALITY_TARGET_FLOOR = 0.05
+DEFAULT_DDP_TIMEOUT_MINUTES = 180
 
 
 def experiment_name() -> str:
@@ -97,7 +98,7 @@ def null_logger() -> logging.Logger:
     return logger
 
 
-def setup_distributed() -> tuple[bool, int, int, int]:
+def setup_distributed(timeout_minutes: int = DEFAULT_DDP_TIMEOUT_MINUTES) -> tuple[bool, int, int, int]:
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         return False, 0, 0, 1
 
@@ -108,7 +109,7 @@ def setup_distributed() -> tuple[bool, int, int, int]:
         torch.cuda.set_device(local_rank)
     backend = "nccl" if torch.cuda.is_available() else "gloo"
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend)
+        dist.init_process_group(backend=backend, timeout=timedelta(minutes=timeout_minutes))
     return True, rank, local_rank, world_size
 
 
@@ -125,11 +126,33 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
+def wrap_ddp(model: torch.nn.Module, device: torch.device, local_rank: int) -> DDP:
+    if device.type == "cuda":
+        return DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+    return DDP(model, find_unused_parameters=False)
+
+
+def refresh_distributed_sampler(sampler, dataset) -> None:
+    if not all(hasattr(sampler, name) for name in ("num_replicas", "drop_last")):
+        return
+
+    dataset_len = len(dataset)
+    num_replicas = int(sampler.num_replicas)
+    if bool(sampler.drop_last) and dataset_len % num_replicas != 0:
+        num_samples = math.ceil((dataset_len - num_replicas) / num_replicas)
+    else:
+        num_samples = math.ceil(dataset_len / num_replicas)
+    sampler.num_samples = num_samples
+    sampler.total_size = num_samples * num_replicas
+
+
 def set_sampler_epoch(loader, epoch: int) -> None:
     dataset = getattr(loader, "dataset", None)
     sampler = getattr(loader, "sampler", None)
     if hasattr(dataset, "set_epoch"):
         dataset.set_epoch(epoch)
+    if sampler is not None and dataset is not None:
+        refresh_distributed_sampler(sampler, dataset)
     if hasattr(sampler, "set_epoch"):
         sampler.set_epoch(epoch)
 
@@ -744,6 +767,12 @@ def parse_args() -> argparse.Namespace:
         help="Thêm detect head P2 stride-4 cho object nhỏ.",
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Đặt -1 để tắt seed cố định.")
+    parser.add_argument(
+        "--ddp_timeout_minutes",
+        type=int,
+        default=int(os.environ.get("DDP_TIMEOUT_MINUTES", DEFAULT_DDP_TIMEOUT_MINUTES)),
+        help="Timeout collective DDP. Cần đủ dài vì rank 0 validate/lưu checkpoint trong khi rank khác chờ.",
+    )
     parser.add_argument("--local_rank", type=int, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -771,6 +800,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--head_depth phải >= 1")
     if args.assign_topk <= 0:
         raise ValueError("--assign_topk phải > 0")
+    if args.ddp_timeout_minutes <= 0:
+        raise ValueError("--ddp_timeout_minutes phải > 0")
     if not 0.0 <= args.quality_target_floor <= 1.0:
         raise ValueError("--quality_target_floor phải nằm trong [0, 1]")
     args.class_weight_overrides = parse_class_weight_overrides(args.class_weight_overrides)
@@ -833,6 +864,7 @@ def train_single_run(
         transforms=transforms,
         img_size=args.img_size,
         seed=run_seed,
+        pin_memory=device.type == "cuda",
         box_type_equalizer=args.box_type_equalizer,
         box_shape_equalizer=args.box_shape_equalizer,
         box_equalizer_oversample=args.box_equalizer_oversample,
@@ -873,6 +905,7 @@ def train_single_run(
             transforms=None,
             img_size=args.img_size,
             seed=run_seed + 1 if run_seed is not None else None,
+            pin_memory=device.type == "cuda",
         )
 
     model = YOLOv8Scratch(
@@ -978,12 +1011,10 @@ def train_single_run(
         best_map = float(resume_state["best_map"])
         best_epoch = int(resume_state["best_epoch"])
         epochs_without_improvement = int(resume_state["epochs_without_improvement"])
+    initial_backbone_trainable = args.freeze_backbone_epochs <= 0 or start_epoch > args.freeze_backbone_epochs
+    set_backbone_trainable(model, initial_backbone_trainable)
     if distributed:
-        if device.type == "cuda":
-            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
-        else:
-            model = DDP(model, find_unused_parameters=True)
-    set_backbone_trainable(model, args.freeze_backbone_epochs <= 0 or start_epoch > args.freeze_backbone_epochs)
+        model = wrap_ddp(model, device, local_rank)
     logger.info(
         "Nhóm optimizer: lr=%.6g backbone_lr=%.6g weight_decay=%.6g",
         args.lr,
@@ -1013,8 +1044,13 @@ def train_single_run(
                     json.dumps(sample_plan_stats["by_mode"], ensure_ascii=False, sort_keys=True),
                     json.dumps(sample_plan_stats["mode_ratios"], ensure_ascii=False, sort_keys=True),
                 )
-        if epoch == args.freeze_backbone_epochs + 1:
-            set_backbone_trainable(model, True)
+        if args.freeze_backbone_epochs > 0 and epoch == args.freeze_backbone_epochs + 1:
+            if isinstance(model, DDP):
+                model = unwrap_model(model)
+                set_backbone_trainable(model, True)
+                model = wrap_ddp(model, device, local_rank)
+            else:
+                set_backbone_trainable(model, True)
             logger.info("Đã mở đóng băng feature extractor ConvNeXt V2 Tiny tại epoch %d", epoch)
 
         train_metrics = train_one_epoch(
@@ -1135,7 +1171,7 @@ def main() -> None:
     if args.num_runs < 1:
         raise ValueError("--num_runs phải >= 1")
 
-    distributed, rank, local_rank, world_size = setup_distributed()
+    distributed, rank, local_rank, world_size = setup_distributed(args.ddp_timeout_minutes)
     try:
         experiment = experiment_name()
         for run_idx in range(args.num_runs):

@@ -1188,18 +1188,23 @@ def build_dataloader(
         )
         shuffle = False
 
-    loader = DataLoader(
-        dataset=dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-        pin_memory=pin_memory and torch.cuda.is_available(),
-        drop_last=drop_last,
-        worker_init_fn=seed_worker if seed is not None else None,
-        generator=generator,
-    )
+    loader_kwargs = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "sampler": sampler,
+        "num_workers": num_workers,
+        "collate_fn": collate_fn,
+        "pin_memory": pin_memory and torch.cuda.is_available(),
+        "drop_last": drop_last,
+        "worker_init_fn": seed_worker if seed is not None else None,
+        "generator": generator,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+
+    loader = DataLoader(**loader_kwargs)
 
     return loader
 
