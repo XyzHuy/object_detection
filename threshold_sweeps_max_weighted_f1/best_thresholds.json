@@ -1,0 +1,86 @@
+{
+  "checkpoint": null,
+  "source_predictions": "predictions.json",
+  "data_root": "public",
+  "split": "val",
+  "img_size": 512,
+  "base_conf_threshold": 0.001,
+  "nms_iou": 0.65,
+  "selection_metric": "weighted_f1",
+  "min_mAP@0.5": 0.0,
+  "max_det": 100,
+  "nms_max_det": 300,
+  "thresholds": {
+    "person": 0.55,
+    "car": 0.5,
+    "dog": 0.7,
+    "cat": 0.6,
+    "chair": 0.7
+  },
+  "metrics": {
+    "mAP@0.5": 0.806175,
+    "performance_points": 20,
+    "iou_threshold": 0.5,
+    "num_ground_truth_boxes": 2021,
+    "num_predictions": 1909,
+    "micro_precision": 0.875851,
+    "micro_recall": 0.827313,
+    "per_class": {
+      "person": {
+        "ap": 0.833811,
+        "num_ground_truth": 1074,
+        "num_predictions": 1037,
+        "true_positives": 915,
+        "false_positives": 122,
+        "recall": 0.851955,
+        "precision": 0.882353,
+        "f1": 0.866888
+      },
+      "car": {
+        "ap": 0.734557,
+        "num_ground_truth": 283,
+        "num_predictions": 267,
+        "true_positives": 218,
+        "false_positives": 49,
+        "recall": 0.770318,
+        "precision": 0.816479,
+        "f1": 0.792727
+      },
+      "dog": {
+        "ap": 0.929891,
+        "num_ground_truth": 206,
+        "num_predictions": 210,
+        "true_positives": 194,
+        "false_positives": 16,
+        "recall": 0.941748,
+        "precision": 0.92381,
+        "f1": 0.932693
+      },
+      "cat": {
+        "ap": 0.927448,
+        "num_ground_truth": 176,
+        "num_predictions": 172,
+        "true_positives": 165,
+        "false_positives": 7,
+        "recall": 0.9375,
+        "precision": 0.959302,
+        "f1": 0.948276
+      },
+      "chair": {
+        "ap": 0.60517,
+        "num_ground_truth": 282,
+        "num_predictions": 223,
+        "true_positives": 180,
+        "false_positives": 43,
+        "recall": 0.638298,
+        "precision": 0.807175,
+        "f1": 0.712871
+      }
+    },
+    "micro_f1": 0.85089,
+    "macro_f1": 0.850691,
+    "weighted_f1": 0.848808,
+    "min_class_f1": 0.712871,
+    "total_false_positives": 237
+  }
+}

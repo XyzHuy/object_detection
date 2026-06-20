@@ -57,6 +57,57 @@ python ./public/tools/evaluate_predictions.py
 
 
 
+## Tune threshold tối ưu F1
+
+Script `utils/tune_thresholds.py` tự dùng GPU nếu `torch.cuda.is_available()` trả về `True`. Khi mục tiêu là tối đa F1 và chấp nhận đánh đổi mAP@0.5, đặt `--selection_metric micro_f1` và `--min_map50 0.0`.
+
+Chạy tune trực tiếp từ checkpoint trên GPU:
+```bash
+PYTHONPATH=. python3 utils/tune_thresholds.py \
+  --checkpoint ./models/best.pth \
+  --source ./public/val/images \
+  --data_root ./public \
+  --split val \
+  --ground_truth ./public/annotations/val.json \
+  --official_evaluator utils/official_evaluator/evaluate_predictions.py \
+  --selection_metric micro_f1 \
+  --min_map50 0.0 \
+  --base_conf 0.001 \
+  --threshold_values 0.001,0.002,0.003,0.005,0.0075,0.01,0.015,0.02,0.03,0.04,0.05,0.075,0.1,0.125,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.5,0.55,0.6,0.65,0.7,0.75,0.8,0.85,0.9,0.95 \
+  --nms_iou_values 0.45,0.50,0.55,0.60,0.65,0.70,0.75 \
+  --max_det 100 \
+  --nms_max_det 300 \
+  --rounds 3 \
+  --output_dir threshold_sweeps_max_f1
+```
+
+Nếu đã có file dự đoán ngưỡng thấp như `predictions.json`, có thể tune offline nhanh hơn:
+```bash
+PYTHONPATH=. python3 utils/tune_thresholds.py \
+  --predictions predictions.json \
+  --data_root public \
+  --split val \
+  --ground_truth public/annotations/val.json \
+  --official_evaluator utils/official_evaluator/evaluate_predictions.py \
+  --selection_metric micro_f1 \
+  --min_map50 0.0 \
+  --base_conf 0.001 \
+  --threshold_values 0.001,0.002,0.003,0.005,0.0075,0.01,0.015,0.02,0.03,0.04,0.05,0.075,0.1,0.125,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.5,0.55,0.6,0.65,0.7,0.75,0.8,0.85,0.9,0.95 \
+  --nms_iou 0.65 \
+  --max_det 100 \
+  --rounds 3 \
+  --output_dir threshold_sweeps_max_f1
+```
+
+Kết quả tune offline hiện tại trên `predictions.json`:
+- Threshold theo class: `person=0.55`, `car=0.50`, `dog=0.70`, `cat=0.60`, `chair=0.70`.
+- `micro_f1 = 0.850890`, `macro_f1 = 0.850691`, `weighted_f1 = 0.848808`.
+- `micro_precision = 0.875851`, `micro_recall = 0.827313`.
+- `mAP@0.5 = 0.806175`, số prediction sau lọc: `1909`.
+- F1 theo lớp: `person=0.866888`, `car=0.792727`, `dog=0.932693`, `cat=0.948276`, `chair=0.712871`.
+
+Khi suy luận với bộ threshold này, truyền thêm `--thresholds threshold_sweeps_max_f1/best_thresholds.json` cho `predict.py`.
+
 ### Tập Test
 
 Với giả định file annotation và tập ảnh của tập test có cùng cấu trúc với train và val
