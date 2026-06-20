@@ -1,3 +1,16 @@
+## Tổng quan dự án
+
+Đây là dự án bài cuối kì cho môn học [Xử lý ảnh 2526II_AIT3002#_1](https://portal.uet.vnu.edu.vn/courses/5889) tại UET. Mục tiêu của project là tự xây dựng một mô hình object detection from scratch cho bài toán phát hiện 5 lớp đối tượng: `person`, `car`, `dog`, `cat`, `chair`.
+
+Mô hình được triển khai theo hướng custom YOLOv8, gồm backbone `ConvNeXtV2Tiny` dùng làm feature extractor, neck YOLOv8 và detection head tự xây dựng. Repo bao gồm pipeline huấn luyện, suy luận, đánh giá, tuning threshold và các module loss/metrics/dataloader phục vụ huấn luyện end-to-end.
+
+Dữ liệu huấn luyện và validation là bộ train/val được cung cấp trong cuộc thi. Theo thống kê trong `dataset_stats`, tập train có 7.500 ảnh, 10.642 bounding boxes và bị mất cân bằng đáng kể giữa các lớp: lớp `person` chiếm khoảng 54,8% số object, trong khi lớp ít nhất là `cat` chỉ khoảng 7,8%; tỉ lệ chênh lệch lớn nhất giữa các lớp xấp xỉ 7 lần. Tập val có 1.500 ảnh, 2.021 bounding boxes và phân bố lớp tương tự.
+
+Kết quả đạt được:
+- Khoảng `0.9 mAP@0.5` trên validation set (`score.json`: `0.894114`).
+- Top 2/62 trên Kaggle Community Prediction Competition: [From Scratch Object Detection Challenge](https://www.kaggle.com/competitions/from-scratch-object-detection-challenge/leaderboard).
+- `mAP@0.5 = 0.86` trên private set của competition.
+
 ## Cài đặt môi trường
 - Với môi trường chỉ có CPU:
 ```bash

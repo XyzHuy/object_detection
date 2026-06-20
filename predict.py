@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import torch
+from huggingface_hub import hf_hub_download
 
 from utils.inference import collect_images, load_class_thresholds, load_model, predict_image
 
@@ -13,7 +14,31 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Chạy suy luận và ghi JSON dự đoán")
     parser.add_argument("--image_dir", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--checkpoint", default="models/best.pth")
+
+    # Local checkpoint vẫn giữ optional để fallback/debug
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Checkpoint local. Nếu không truyền, sẽ tải weight từ Hugging Face.",
+    )
+
+    # Hugging Face checkpoint config
+    parser.add_argument(
+        "--hf_repo_id",
+        default="xyzhuy/object_detection",
+        help="Hugging Face model repo id.",
+    )
+    parser.add_argument(
+        "--hf_filename",
+        default="best.pth",
+        help="Tên file weight trong Hugging Face repo.",
+    )
+    parser.add_argument(
+        "--hf_revision",
+        default=None,
+        help="Branch commit trên Hugging Face.",
+    )
+
     parser.add_argument(
         "--thresholds",
         help="File JSON ngưỡng đã tune. Mặc định dùng models/best_thresholds.json nếu có.",
@@ -24,6 +49,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_det", type=int)
     parser.add_argument("--nms_max_det", type=int)
     return parser.parse_args()
+
+
+def resolve_checkpoint_path(args: argparse.Namespace) -> Path:
+    if args.checkpoint is not None:
+        checkpoint_path = Path(args.checkpoint)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Không tìm thấy checkpoint local: {checkpoint_path}")
+        return checkpoint_path
+
+    print(f"Đang tải checkpoint từ Hugging Face: {args.hf_repo_id}/{args.hf_filename}")
+
+    checkpoint_path = hf_hub_download(
+        repo_id=args.hf_repo_id,
+        filename=args.hf_filename,
+        repo_type="model",
+        revision=args.hf_revision,
+    )
+
+    return Path(checkpoint_path)
 
 
 def load_threshold_config(path: Path | None) -> dict:
@@ -40,36 +84,46 @@ def load_classes_from_checkpoint(checkpoint: dict, checkpoint_path: Path) -> lis
     fallback = Path("public/annotations/train.json")
     if fallback.exists():
         return json.loads(fallback.read_text(encoding="utf-8"))["classes"]
-    raise ValueError(f"Checkpoint {checkpoint_path} không lưu classes và không tìm thấy {fallback}")
+
+    raise ValueError(
+        f"Checkpoint {checkpoint_path} không lưu classes và không tìm thấy {fallback}"
+    )
 
 
 def main() -> None:
     args = parse_args()
-    checkpoint_path = Path(args.checkpoint)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Không tìm thấy checkpoint: {checkpoint_path}")
+
+    checkpoint_path = resolve_checkpoint_path(args)
 
     threshold_path = Path(args.thresholds) if args.thresholds else Path("models/best_thresholds.json")
     threshold_config = load_threshold_config(threshold_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Sử dụng thiết bị: {device}")
+    print(f"Sử dụng checkpoint: {checkpoint_path}")
+
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     classes = load_classes_from_checkpoint(checkpoint, checkpoint_path)
+
     model, _ = load_model(checkpoint_path, len(classes), device)
 
     class_thresholds = load_class_thresholds(threshold_path, classes) if threshold_config else None
+
     img_size = args.img_size or int(threshold_config.get("img_size", 768))
+
     conf_threshold = args.conf_threshold
     if conf_threshold is None:
-        conf_threshold = float(threshold_config.get("base_conf_threshold", 0.001))
+        conf_threshold = float(threshold_config.get("base_conf_threshold", 0.0001))
+
     nms_iou = args.nms_iou
     if nms_iou is None:
         nms_iou = float(threshold_config.get("nms_iou", 0.65))
+
     max_det = args.max_det or int(threshold_config.get("max_det", 100))
     nms_max_det = args.nms_max_det or int(threshold_config.get("nms_max_det", max_det))
 
     predictions = []
+
     for image_path in collect_images(args.image_dir):
         result = predict_image(
             model=model,
@@ -82,18 +136,28 @@ def main() -> None:
             max_det=nms_max_det,
             class_thresholds=class_thresholds,
         )
-        result["boxes"] = sorted(result["boxes"], key=lambda item: item["confidence"], reverse=True)[:max_det]
+
+        result["boxes"] = sorted(
+            result["boxes"],
+            key=lambda item: item["confidence"],
+            reverse=True,
+        )[:max_det]
+
         predictions.append(result)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(predictions, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    output_path.write_text(
+        json.dumps(predictions, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
     print(f"Đã ghi dự đoán cho {len(predictions)} ảnh vào {output_path}")
 
 
 if __name__ == "__main__":
     main()
-""" 
-python predict.py \
-  --image_dir public/val/images \
-  --output predictions.json """
+
+
+"""python predict.py --image_dir public/val/images --output predictions.json """
